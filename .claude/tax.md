@@ -44,7 +44,8 @@ def apply_cash_rounding(total_cents: int) -> int:
 
 - Tax calculated on price **after** deal discount applied (see features.md).
 - GST applies to taxable items by department default; PST is per-department.
-- Medicine, gift cards, lottery → GST=0, PST=0.
+- Gift cards, lottery → GST=0, PST=0.
+- Medicine (OTC: Tylenol, Advil, bandaids, lip balm, etc.) → GST=1, PST=0 (BC: PST-exempt, GST applies).
 - Bottle deposit = flat per-unit, not % — applies on top of subtotal, before tax-of-tax (BC: deposit is not GST-able for our SKUs).
 - Cash rounding applied **only to grand total**, never per line.
 - For split tender: cash portion rounded, card portion exact, sum stored in `rounded_total_cents`.

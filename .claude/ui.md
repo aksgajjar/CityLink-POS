@@ -96,25 +96,16 @@ SIZES = {
 
 ## Departments + tax defaults
 
-```python
-DEPARTMENTS = [
-    {"id":"candy",          "label":"Candy",          "color":"#FF6B6B", "gst":1,"pst":1,"deposit":"none"},
-    {"id":"drinks",         "label":"Drinks",         "color":"#4A90D9", "gst":1,"pst":0,"deposit":"355ml"},
-    {"id":"carbonated",     "label":"Carbonated",     "color":"#E74C3C", "gst":1,"pst":1,"deposit":"355ml"},
-    {"id":"non_carbonated", "label":"Non-Carbonated", "color":"#E67E22", "gst":1,"pst":0,"deposit":"355ml"},
-    {"id":"snacks",         "label":"Snacks",         "color":"#F39C12", "gst":1,"pst":1,"deposit":"none"},
-    {"id":"confectionery",  "label":"Confectionery",  "color":"#D4AC0D", "gst":1,"pst":1,"deposit":"none"},
-    {"id":"medicine",       "label":"Medicine",       "color":"#27AE60", "gst":0,"pst":0,"deposit":"none"},
-    {"id":"stationary",     "label":"Stationary",     "color":"#8E44AD", "gst":1,"pst":0,"deposit":"none"},
-    {"id":"gift_items",     "label":"Gift Items",     "color":"#E91E8C", "gst":1,"pst":0,"deposit":"none"},
-    {"id":"gift_cards",     "label":"Gift Cards",     "color":"#16A085", "gst":0,"pst":0,"deposit":"none"},
-    {"id":"ice_cream",      "label":"Ice Cream",      "color":"#FF8C42", "gst":1,"pst":1,"deposit":"none"},
-    {"id":"slush",          "label":"Slush",          "color":"#00BCD4", "gst":1,"pst":1,"deposit":"none"},
-    {"id":"lottery",        "label":"Lottery",        "color":"#6C3483", "gst":0,"pst":0,"deposit":"none"},
-    {"id":"accessories",    "label":"Accessories",    "color":"#546E7A", "gst":1,"pst":0,"deposit":"none"},
-    {"id":"retail",         "label":"Retail",         "color":"#1B6B3A", "gst":1,"pst":0,"deposit":"none"},
-]
-```
+**Source of truth:** `core/departments.py` — do not duplicate the list here.
+
+Exports:
+- `DEPARTMENTS: list[DeptDef]` — full per-dept defs (id, label, color, gst, pst, deposit). 15 entries.
+- `DEPT_BY_ID: dict[str, DeptDef]` — id lookup (raises `KeyError` via `get_dept(id)`).
+- `DEPT_TAX_DEFAULTS: dict[str, dict]` — tax-only view, consumed by `core/cart.py:add_manual()`.
+- `DEPT_COLORS: dict[str, str]` — color-only view, consumed by `ui/styles.py`.
+
+When adding/changing a department, edit `core/departments.py` only. `ui/styles.py` and `core/cart.py` pick it up automatically.
+
 
 ## Register screen layout
 
