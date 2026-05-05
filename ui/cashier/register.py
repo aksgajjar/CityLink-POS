@@ -1253,7 +1253,7 @@ class RegisterScreen(QWidget):
         self._numpad_clear()
 
     def _on_eod(self) -> None:
-        """Footer EOD: generate end-of-day PDF + close shift."""
+        """Footer EOD: force closing-cash count, generate PDF, close shift, lock."""
         if self.shift_id is None:
             self._error("No active shift — nothing to close.")
             return
@@ -1263,38 +1263,45 @@ class RegisterScreen(QWidget):
                 "(Items will be discarded — hold or finish them first.)"
             ):
                 return
-        if not self._confirm(
-            "Close shift and print End-of-Day report?"
-        ):
-            return
-
-        # Optional: ask for closing cash count
-        # Simple flow: use numpad value if any, else None (variance shown blank)
-        closing_cash = self._numpad_cents() if self._numpad_cents() > 0 else None
 
         try:
             from core import reports as _r
+            pre_data = _r.collect_eod(self.shift_id)
+        except Exception:
+            log.exception("EOD pre-collect failed")
+            self._error("Could not collect shift data. See errors.log.")
+            return
+
+        expected = pre_data["reconciliation"]["expected_cash_cents"]
+
+        # FORCE closing cash count — no skip allowed
+        dlg = CashCountDialog(expected_cents=expected, parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return   # cashier cancelled — abort entire EOD
+        closing_cash = dlg.counted_cents
+        variance = closing_cash - expected
+
+        if abs(variance) > 500:
+            sign = "+" if variance > 0 else "-"
+            if not self._confirm(
+                f"Cash variance {sign}${abs(variance)/100:.2f} exceeds $5.00.\n\n"
+                f"Expected: ${expected/100:.2f}\n"
+                f"Counted:  ${closing_cash/100:.2f}\n\n"
+                f"Close shift anyway?"
+            ):
+                return
+
+        try:
+            db.close_shift(self.shift_id, closing_cash)
             data = _r.collect_eod(self.shift_id)
             store = self.config_store_dict()
-            # Persist closing + close shift BEFORE generating PDF so the report includes
-            # the closing cash count and `closed_at` timestamp.
-            try:
-                if closing_cash is not None:
-                    db.close_shift(self.shift_id, closing_cash)
-                else:
-                    # Close with expected as closing if cashier didn't provide a count
-                    db.close_shift(self.shift_id, data["reconciliation"]["expected_cash_cents"])
-                # Re-collect after close so closed_at + closing_cash appear in PDF
-                data = _r.collect_eod(self.shift_id)
-            except Exception:
-                log.exception("close_shift failed; report will reflect open state")
-
             pdf = _r.render_eod_pdf(data, store=store)
-            log.info("EOD PDF: %s", pdf)
-            # Open in system viewer (macOS / Linux / Windows best-effort)
+            log.info("EOD PDF: %s (variance=%s)", pdf, variance)
             self._open_file(pdf)
-            self._info(f"EOD report saved.\n{pdf.name}")
-            # Cashier session must lock — shift is closed
+            self._info(
+                f"EOD report saved.\n{pdf.name}\n\n"
+                f"Variance: ${variance/100:+.2f}"
+            )
             self.logout_requested.emit()
         except Exception:
             log.exception("EOD generation failed")
@@ -1750,6 +1757,160 @@ class Toast(QLabel):
         self.show()
         self.raise_()
         QTimer.singleShot(ms, self.deleteLater)
+
+
+# ─── Cash count dialog (EOD shift close) ─────────────────────────────────────
+
+class CashCountDialog(QDialog):
+    """Force cashier to enter actual cash drawer count. Variance shown live.
+
+    On accept: `self.counted_cents` is set. No skip — cashier cancels by Cancel,
+    which aborts the entire EOD flow.
+    """
+
+    def __init__(self, *, expected_cents: int, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.setObjectName("cash_count_dialog")
+        self.setWindowTitle("Closing Cash Count")
+        self.setModal(True)
+        self.setMinimumSize(420, 540)
+        self.expected_cents = expected_cents
+        self.counted_cents: int = 0
+        self._buf = ""
+        self._build()
+        self._render()
+
+    def _build(self) -> None:
+        v = QVBoxLayout(self)
+        v.setContentsMargins(20, 20, 20, 20)
+        v.setSpacing(10)
+
+        title = QLabel("Closing Cash Count")
+        title.setObjectName("cash_count_title")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        f = QFont(styles.FONT_FAMILY, 16); f.setBold(True)
+        title.setFont(f)
+        title.setStyleSheet(f"color: {styles.COLORS['navy']};")
+        v.addWidget(title)
+
+        sub = QLabel("Count the cash drawer. Required to close shift.")
+        sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        sub.setStyleSheet(f"color: {styles.COLORS['text_muted']};")
+        v.addWidget(sub)
+
+        # Expected
+        exp_row = QHBoxLayout()
+        exp_lbl = QLabel("Expected in drawer:")
+        exp_val = QLabel(f"${self.expected_cents / 100:.2f}")
+        ef = QFont(styles.FONT_FAMILY, 14); ef.setBold(True)
+        exp_val.setFont(ef)
+        exp_val.setStyleSheet(f"color: {styles.COLORS['navy']};")
+        exp_row.addWidget(exp_lbl); exp_row.addStretch(1); exp_row.addWidget(exp_val)
+        v.addLayout(exp_row)
+
+        # Counted display
+        self._counted_lbl = QLabel("$0.00")
+        self._counted_lbl.setObjectName("cash_count_counted")
+        self._counted_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        cf = QFont(styles.FONT_FAMILY, 32); cf.setBold(True)
+        self._counted_lbl.setFont(cf)
+        self._counted_lbl.setStyleSheet(
+            f"color: {styles.COLORS['navy']}; padding: 12px;"
+            f" border: 2px solid {styles.COLORS['blue_mid']}; border-radius: 8px;"
+            f" background-color: white;"
+        )
+        v.addWidget(self._counted_lbl)
+
+        # Variance label (color-coded)
+        self._var_lbl = QLabel("Variance: $0.00")
+        self._var_lbl.setObjectName("cash_count_variance")
+        self._var_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        vf = QFont(styles.FONT_FAMILY, 12); vf.setBold(True)
+        self._var_lbl.setFont(vf)
+        v.addWidget(self._var_lbl)
+
+        # Numpad grid
+        grid = QGridLayout()
+        grid.setSpacing(6)
+        positions = [
+            ("7", 0, 0), ("8", 0, 1), ("9", 0, 2),
+            ("4", 1, 0), ("5", 1, 1), ("6", 1, 2),
+            ("1", 2, 0), ("2", 2, 1), ("3", 2, 2),
+            ("0", 3, 0), ("00", 3, 1), ("←", 3, 2),
+        ]
+        for txt, r, c in positions:
+            b = QPushButton(txt)
+            b.setObjectName(f"cash_count_btn_{txt}")
+            b.setMinimumHeight(50)
+            bf = QFont(styles.FONT_FAMILY, 16); bf.setBold(True)
+            b.setFont(bf)
+            if txt == "←":
+                b.clicked.connect(self._back)
+            else:
+                b.clicked.connect(lambda _ck=False, x=txt: self._input(x))
+            grid.addWidget(b, r, c)
+        v.addLayout(grid)
+
+        # Action row
+        h = QHBoxLayout(); h.setSpacing(8)
+        clr = QPushButton("CLR"); clr.setObjectName("cash_count_btn_clr")
+        clr.setMinimumHeight(48)
+        clr.clicked.connect(self._clear)
+        h.addWidget(clr)
+        cancel = QPushButton("Cancel"); cancel.setObjectName("cash_count_cancel")
+        cancel.setMinimumHeight(48)
+        cancel.clicked.connect(self.reject)
+        h.addWidget(cancel)
+        ok = QPushButton("Close Shift"); ok.setObjectName("cash_count_ok")
+        ok.setMinimumHeight(48)
+        of = QFont(styles.FONT_FAMILY, 13); of.setBold(True)
+        ok.setFont(of)
+        ok.setStyleSheet(
+            f"QPushButton {{ background-color: {styles.COLORS['btn_cash']}; color: white;"
+            f" border: none; border-radius: 6px; padding: 8px 16px; }}"
+            f"QPushButton:disabled {{ background-color: #BDBDBD; color: #757575; }}"
+        )
+        ok.setEnabled(False)
+        ok.clicked.connect(self._accept)
+        self._ok_btn = ok
+        h.addWidget(ok)
+        v.addLayout(h)
+
+    def _input(self, ch: str) -> None:
+        if len(self._buf.replace(".", "")) + len(ch) > 7:
+            return
+        self._buf += ch
+        self._render()
+
+    def _back(self) -> None:
+        if not self._buf:
+            return
+        self._buf = self._buf[:-1]
+        self._render()
+
+    def _clear(self) -> None:
+        self._buf = ""
+        self._render()
+
+    def _render(self) -> None:
+        cents = int(self._buf) if self._buf.isdigit() else 0
+        self._counted_lbl.setText(f"${cents / 100:.2f}")
+        var = cents - self.expected_cents
+        sign = "+" if var > 0 else "-" if var < 0 else ""
+        self._var_lbl.setText(f"Variance: {sign}${abs(var) / 100:.2f}")
+        if abs(var) <= 500:
+            color = styles.COLORS["btn_cash"]   # green within $5
+        elif abs(var) <= 2000:
+            color = styles.COLORS["warning"]    # yellow $5-$20
+        else:
+            color = styles.COLORS["danger"]     # red >$20
+        self._var_lbl.setStyleSheet(f"color: {color}; font-weight: bold;")
+        # Enable OK only when buffer non-empty
+        self._ok_btn.setEnabled(bool(self._buf))
+
+    def _accept(self) -> None:
+        self.counted_cents = int(self._buf) if self._buf.isdigit() else 0
+        self.accept()
 
 
 # ─── Change dialog ───────────────────────────────────────────────────────────

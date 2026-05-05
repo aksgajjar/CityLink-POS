@@ -293,6 +293,7 @@ def update_user_pin(user_id: int, new_pin: str) -> None:
 _ITEM_UPDATE_COLS = {
     "barcode", "name", "price_cents", "department",
     "tax_gst", "tax_pst", "bottle_deposit", "age_restricted",
+    "is_active",
 }
 
 
@@ -702,7 +703,7 @@ def log_cash_event(
     note: Optional[str] = None,
 ) -> int:
     """Log drop / petty_cash / no_sale event for a shift."""
-    if event_type not in {"drop", "petty_cash", "no_sale"}:
+    if event_type not in {"drop", "petty_cash", "no_sale", "till_count"}:
         raise ValueError(f"invalid cash event_type: {event_type}")
     with transaction() as c:
         cur = c.execute(
@@ -768,3 +769,9 @@ def list_barcode_misses(limit: int = 100) -> list[dict]:
            ORDER BY scan_count DESC, last_scanned DESC LIMIT ?""",
         (limit,),
     ).fetchall()]
+
+
+def clear_barcode_miss(barcode: str) -> None:
+    """Remove a barcode-miss row (called after admin creates the missing item)."""
+    with transaction() as c:
+        c.execute("DELETE FROM barcode_misses WHERE barcode = ?", (barcode,))
