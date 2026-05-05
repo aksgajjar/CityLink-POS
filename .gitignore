@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.spec
+
+# App data (do not commit store data)
+data/store.db
+data/*.db-shm
+data/*.db-wal
+exports/
+
+# Logs
+errors.log
+*.log
+
+# Config (contains store-specific settings + terminal IP)
+# Keep config.json.example, not config.json
+config.json
+
+# macOS
+.DS_Store
+.AppleDouble
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# PyInstaller output
+*.exe
+*.app
+
+# IDE
+.vscode/
+.idea/
+*.swp
