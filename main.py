@@ -48,6 +48,7 @@ from core.logger import get_logger, setup_logger
 from core.models import User
 from core.payment.base import PaymentTerminal
 from core.payment.detector import get_terminal
+from core.sound import ClickSoundFilter, SoundPlayer, generate_sounds_if_missing
 
 from ui import styles
 from ui.cashier.numpad import MODE_PRICE, Numpad
@@ -84,6 +85,10 @@ DEFAULT_CONFIG: dict = {
         "require_pin_for_void": True,
         "require_pin_for_price_override": True,
         "inactivity_timeout_seconds": 120,
+    },
+    "sound": {
+        "enabled": True,
+        "volume": 80,
     },
 }
 
@@ -248,6 +253,13 @@ class MainWindow(QMainWindow):
         # Returned regardless of connect outcome — UI inspects is_connected().
         self.terminal: PaymentTerminal = get_terminal(config)
 
+        # Sound feedback (click/success/error). WAVs auto-generated at boot.
+        snd_cfg = config.get("sound", {}) or {}
+        self.sound_player: SoundPlayer = SoundPlayer(
+            enabled=bool(snd_cfg.get("enabled", True)),
+            volume_pct=int(snd_cfg.get("volume", 80)),
+        )
+
         self.setStyleSheet(styles.get_stylesheet())
 
         self.stack = QStackedWidget()
@@ -318,6 +330,7 @@ class MainWindow(QMainWindow):
             shift_id=self._current_shift_id,
             store_name=self.store_name,
             terminal=self.terminal,
+            sound_player=self.sound_player,
         )
         self._register.logout_requested.connect(self._on_logout)
         self._register.admin_requested.connect(self._on_admin_requested)
@@ -450,9 +463,19 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.seed_admin:
         _seed_admin_if_needed(args.seed_admin)
 
+    # Generate sound assets if missing (one-time, idempotent)
+    try:
+        generate_sounds_if_missing()
+    except Exception:
+        log.exception("sound asset generation failed; continuing without sound")
+
     app = QApplication(sys.argv)
     app.setStyleSheet(styles.get_stylesheet())
     win = MainWindow(config)
+    # Install app-wide click sound filter
+    sound_filter = ClickSoundFilter(win.sound_player)
+    app.installEventFilter(sound_filter)
+    win._sound_filter_ref = sound_filter   # keep alive for app lifetime
     win.showMaximized()
     return app.exec()
 

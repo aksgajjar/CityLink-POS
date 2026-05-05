@@ -25,7 +25,16 @@ from __future__ import annotations
 import time as _time
 from typing import Optional
 
-from PyQt6.QtCore import QObject, Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import (
+    QEasingCurve,
+    QObject,
+    QPropertyAnimation,
+    QRect,
+    Qt,
+    QThread,
+    QTimer,
+    pyqtSignal,
+)
 from PyQt6.QtGui import QFont, QKeyEvent
 from PyQt6.QtWidgets import (
     QDialog,
@@ -76,6 +85,7 @@ class RegisterScreen(QWidget):
         shift_id: Optional[int] = None,
         store_name: str = "CityLink Convenience",
         terminal: Optional[PaymentTerminal] = None,
+        sound_player=None,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -85,12 +95,13 @@ class RegisterScreen(QWidget):
         self.shift_id = shift_id
         self.store_name = store_name
         self.terminal: Optional[PaymentTerminal] = terminal
+        self.sound_player = sound_player
         self._barcode_buffer = ""
 
         # Card payment state (QThread + worker held during a transaction)
         self._payment_thread: Optional[QThread] = None
         self._payment_worker: Optional["PaymentWorker"] = None
-        self._processing_overlay: Optional["ProcessingOverlay"] = None
+        self._card_sheet: Optional["CardPaymentSheet"] = None
         self._pending_card_req: Optional[PaymentRequest] = None
 
         self._build_ui()
@@ -186,30 +197,47 @@ class RegisterScreen(QWidget):
         h.addWidget(lab)
         return banner
 
-    # ─── Left panel: cart (stretch) → Hold/Cancel ────────────────────────────
+    # ─── Left panel: cart only (Hold/Cancel live inside cart_widget now) ─────
 
     def _build_left_panel(self) -> QWidget:
-        panel = QWidget()
-        panel.setObjectName("register_left_panel")
-        v = QVBoxLayout(panel)
-        v.setContentsMargins(0, 0, 0, 0)
-        v.setSpacing(4)
-
         self.cart_widget = CartWidget(self.cart)
         self.cart_widget.setObjectName("register_cart")
-        v.addWidget(self.cart_widget, stretch=1)
+        self.cart_widget.hold_clicked.connect(self._on_hold)
+        self.cart_widget.cancel_clicked.connect(self._on_clear_cart)
+        self.cart_widget.restore_held_requested.connect(self._on_restore_held)
+        # Sync the HELD pill with the DB on load
+        self._refresh_held_count()
+        return self.cart_widget
 
-        # Hold / Cancel quick-access at bottom
-        h = QHBoxLayout()
-        h.setSpacing(8)
-        b_hold = self._mk_action("Hold", "act_hold_left", "btn_hold")
-        b_hold.clicked.connect(self._on_hold)
-        h.addWidget(b_hold)
-        b_cancel = self._mk_action("Cancel", "act_cancel_left", "btn_cancel")
-        b_cancel.clicked.connect(self._on_clear_cart)
-        h.addWidget(b_cancel)
-        v.addLayout(h)
-        return panel
+    def _refresh_held_count(self) -> None:
+        try:
+            self.cart_widget.update_held_count(len(db.list_held()))
+        except Exception:
+            log.exception("held count refresh failed")
+
+    def _on_restore_held(self, held_id: int) -> None:
+        if not self.cart.is_empty():
+            if not self._confirm("Replace current cart with held cart?"):
+                return
+            self.cart.clear()
+        popped = db.retrieve_held(held_id)
+        if popped is None:
+            self._error("Hold no longer exists.")
+            self._refresh_held_count()
+            return
+        try:
+            from core.cart import Cart as _C
+            restored = _C.from_json(popped["cart_json"])
+        except Exception:
+            log.exception("hold parse failed")
+            self._error("Failed to restore held cart.")
+            return
+        for ln in restored.lines:
+            self.cart.lines.append(ln)
+        self.cart.recompute()
+        self.cart_widget.refresh()
+        self._refresh_held_count()
+        self._info("Cart retrieved.")
 
     # ─── Right panel: pixel-perfect NRS clone ────────────────────────────────
 
@@ -265,29 +293,18 @@ class RegisterScreen(QWidget):
         v.setSpacing(3)
         v.setContentsMargins(2, 4, 2, 2)
 
-        # Row A: Hold / Retrieve / No Sale
+        # Row A: Cancel Item / No Sale / Override Price
+        # (Hold + Retrieve dropped — Hold is inside cart panel, Retrieve via HELD pill)
         h1 = QHBoxLayout(); h1.setSpacing(3)
         for label, name, color_key, slot in [
-            ("Hold",     "act_hold",     "btn_hold",    self._on_hold),
-            ("Retrieve", "act_retrieve", "btn_hold",    self._on_retrieve),
-            ("No Sale",  "act_no_sale",  "btn_no_sale", self._on_no_sale),
+            ("Cancel Item",    "act_cancel_item",    "btn_cancel",  self._on_cancel_item),
+            ("No Sale",        "act_no_sale",        "btn_no_sale", self._on_no_sale),
+            ("Override Price", "act_override_price", "btn_void",    self._on_override_price),
         ]:
             b = self._mk_action(label, name, color_key, height=40)
             b.clicked.connect(slot)
             h1.addWidget(b)
         v.addLayout(h1)
-
-        # Row B: Cancel Item / Clear Cart / Override Price
-        h2 = QHBoxLayout(); h2.setSpacing(3)
-        for label, name, color_key, slot in [
-            ("Cancel Item",    "act_cancel_item",    "btn_cancel", self._on_cancel_item),
-            ("Clear Cart",     "act_clear_cart",     "btn_void",   self._on_clear_cart),
-            ("Override Price", "act_override_price", "btn_void",   self._on_override_price),
-        ]:
-            b = self._mk_action(label, name, color_key, height=40)
-            b.clicked.connect(slot)
-            h2.addWidget(b)
-        v.addLayout(h2)
 
         # Row C: Price Check full width
         pc = self._mk_action("Price Check", "act_price_check", "btn_hold", height=40)
@@ -726,6 +743,16 @@ class RegisterScreen(QWidget):
     def _update_clock(self) -> None:
         self._clock_label.setText(_time.strftime("%-I:%M %p", _time.localtime()))
 
+    # ─── Sound helpers (no-op if sound_player is None) ───────────────────────
+
+    def _play_success(self) -> None:
+        if self.sound_player is not None:
+            self.sound_player.play_success()
+
+    def _play_error(self) -> None:
+        if self.sound_player is not None:
+            self.sound_player.play_error()
+
     def _refresh_terminal_dot(self) -> None:
         if self.terminal is not None and self.terminal.is_connected():
             if is_mock(self.terminal):
@@ -863,6 +890,7 @@ class RegisterScreen(QWidget):
         # Hardware stubs
         self._open_cash_drawer()
         self._print_receipt(txn, tid)
+        self._play_success()
         self._show_change_dialog(ref, change_cents)
         # Reset register state
         self.cart.clear()
@@ -891,8 +919,7 @@ class RegisterScreen(QWidget):
             self._info("Payment already in progress.")
             return
 
-        # Card uses exact total (no cash rounding)
-        amount = self.cart.totals["total_cents"]
+        amount = self.cart.totals["total_cents"]   # card = exact, no rounding
         if amount <= 0:
             self._error("Total is $0 — nothing to charge.")
             return
@@ -901,13 +928,18 @@ class RegisterScreen(QWidget):
             amount_cents=amount,
             transaction_ref=db.next_transaction_ref(),
         )
+        self._start_payment_worker()
 
-        # Modal overlay blocks UI while QThread waits on the terminal
-        self._processing_overlay = ProcessingOverlay(
-            self,
-            f"Processing card... ${amount / 100:.2f}",
-        )
-        self._processing_overlay.show()
+    def _start_payment_worker(self) -> None:
+        """Build sheet, spawn worker. Used both initially and on Try Again."""
+        amount = self._pending_card_req.amount_cents
+
+        if self._card_sheet is None:
+            self._card_sheet = CardPaymentSheet(self)
+            self._card_sheet.cancel_requested.connect(self._on_sheet_cancel)
+            self._card_sheet.try_again_clicked.connect(self._on_sheet_try_again)
+            self._card_sheet.accept_cash_clicked.connect(self._on_sheet_accept_cash)
+        self._card_sheet.show_processing(amount)
 
         self._payment_thread = QThread(self)
         self._payment_worker = PaymentWorker(self.terminal, self._pending_card_req)
@@ -918,37 +950,134 @@ class RegisterScreen(QWidget):
         self._payment_thread.finished.connect(self._payment_worker.deleteLater)
         self._payment_thread.finished.connect(self._payment_thread.deleteLater)
         self._payment_thread.start()
-        log.info("card payment thread started, ref=%s", self._pending_card_req.transaction_ref)
+        log.info("card payment thread started, ref=%s",
+                 self._pending_card_req.transaction_ref)
 
     def _on_card_response(self, resp: PaymentResponse) -> None:
-        # Tear down overlay + thread refs first so UI is responsive immediately
-        if self._processing_overlay is not None:
-            self._processing_overlay.accept()
-            self._processing_overlay = None
         self._payment_worker = None
         self._payment_thread = None
-
         req = self._pending_card_req
-        self._pending_card_req = None
         if req is None:
             log.error("card response received with no pending request")
             return
+        if self._card_sheet is None:
+            log.error("card response received with no sheet")
+            return
+        self._card_sheet.lock_cancel()
 
         if resp.approved:
-            self._finalize_card(req, resp)
-            return
-
-        if resp.result == RESULT_DECLINED:
-            self._error(
-                f"Card Declined — try again\n\n{resp.error_message or ''}"
-            )
+            self._play_success()
+            self._card_sheet.show_approved()
+            QTimer.singleShot(1500, lambda: self._after_card_approved(req, resp))
+        elif resp.result == RESULT_DECLINED:
+            self._play_error()
+            self._card_sheet.show_declined()
+            QTimer.singleShot(1000, lambda: self._after_card_declined(resp))
         elif resp.result == RESULT_TIMEOUT:
-            if self._confirm("Terminal timeout.\n\nAccept cash instead?"):
-                self._info(
-                    "Enter cash tender on the numpad, then press Cash."
-                )
+            self._play_error()
+            self._card_sheet.show_timeout()
         else:
-            self._error(f"Payment error: {resp.error_message or '(no detail)'}")
+            self._play_error()
+            self._card_sheet.show_error(resp.error_message or "Payment error")
+            QTimer.singleShot(1500, self._dismiss_sheet_and_clear_req)
+
+    def _after_card_approved(self, req: PaymentRequest, resp: PaymentResponse) -> None:
+        self._dismiss_sheet()
+        self._pending_card_req = None
+        # Print Receipt? dialog
+        if self._confirm("Print receipt?"):
+            self._print_receipt_card_stub(req, resp)
+        self._finalize_card_db(req, resp)
+
+    def _after_card_declined(self, resp: PaymentResponse) -> None:
+        self._dismiss_sheet()
+        self._pending_card_req = None
+        self._show_toast(f"Card Declined — {resp.error_message or 'try again'}", danger=True)
+
+    def _on_sheet_cancel(self) -> None:
+        # Cashier-initiated cancel BEFORE terminal responds.
+        # Mock can't be aborted mid-sleep; just dismiss visually and let the
+        # response (already pending) be discarded by lock_cancel state.
+        log.info("card payment cancel requested by cashier")
+        self._dismiss_sheet()
+        self._pending_card_req = None
+        # Worker still finishes; _on_card_response sees no sheet → bails out.
+
+    def _on_sheet_try_again(self) -> None:
+        if self._pending_card_req is None:
+            self._dismiss_sheet()
+            return
+        log.info("retrying card payment ref=%s",
+                 self._pending_card_req.transaction_ref)
+        self._start_payment_worker()
+
+    def _on_sheet_accept_cash(self) -> None:
+        self._dismiss_sheet()
+        self._pending_card_req = None
+        self._info("Enter cash tender on the numpad, then press Cash.")
+
+    def _dismiss_sheet(self) -> None:
+        if self._card_sheet is not None:
+            self._card_sheet.slide_out()
+
+    def _dismiss_sheet_and_clear_req(self) -> None:
+        self._dismiss_sheet()
+        self._pending_card_req = None
+
+    def _show_toast(self, message: str, *, danger: bool = False) -> None:
+        toast = Toast(self, message, danger=danger)
+        toast.show_for(2000)
+
+    def _finalize_card_db(self, req: PaymentRequest, resp: PaymentResponse) -> None:
+        t = self.cart.totals
+        txn = Transaction(
+            transaction_ref=req.transaction_ref,
+            subtotal_cents=t["subtotal_cents"],
+            discount_cents=t["discount_cents"],
+            gst_cents=t["gst_cents"],
+            pst_cents=t["pst_cents"],
+            deposit_cents=t["deposit_cents"],
+            bag_charge_cents=t["bag_charge_cents"],
+            total_cents=t["total_cents"],
+            rounded_total_cents=t["total_cents"],
+            payment_method="card",
+            cash_tendered_cents=0,
+            change_cents=0,
+            card_amount_cents=req.amount_cents,
+            card_auth_code=resp.auth_code,
+            card_last4=resp.card_last4,
+            cashier_id=self.cashier.id,
+            cashier_name=self.cashier.name,
+            shift_id=self.shift_id,
+            items=list(self.cart.lines),
+        )
+        items_data = [ln.to_db_dict() for ln in self.cart.lines]
+        try:
+            tid = db.insert_transaction(txn.header_dict(), items_data)
+        except Exception:
+            log.exception("card transaction insert failed")
+            self._error("Failed to save transaction. See errors.log.")
+            return
+        for ln in self.cart.lines:
+            if ln.kind == "lottery":
+                try:
+                    db.log_lottery(
+                        "sale",
+                        ln.unit_price_cents * ln.quantity,
+                        self.cashier.name,
+                        shift_id=self.shift_id,
+                        transaction_id=tid,
+                        description=ln.name,
+                    )
+                except Exception:
+                    log.exception("lottery_ledger insert failed")
+        self.cart.clear()
+        self._numpad_clear()
+        self.cart_widget.refresh()
+
+    def _print_receipt_card_stub(self, req: PaymentRequest, resp: PaymentResponse) -> None:
+        log.info("[STUB] print card receipt ref=%s auth=%s last4=%s",
+                 req.transaction_ref, resp.auth_code, resp.card_last4)
 
     def _finalize_card(self, req: PaymentRequest, resp: PaymentResponse) -> None:
         t = self.cart.totals
@@ -1108,29 +1237,18 @@ class RegisterScreen(QWidget):
             return
         self.cart.clear()
         self.cart_widget.refresh()
-        self._info("Cart held.")
+        self._refresh_held_count()
+        # No info dialog; the HELD pill above the cart is the visual confirmation
 
     def _on_retrieve(self) -> None:
+        # Legacy entry point — Retrieve button removed; HELD pill on cart panel
+        # is the new path. Forward to the pill handler so existing callers keep
+        # working.
         held = db.list_held()
         if not held:
             self._info("No held carts.")
             return
-        # Minimal MVP: pop most recent hold. Step 11+ can show a chooser dialog.
-        if not self._confirm(f"Retrieve most recent hold (by {held[0]['cashier_name']})?"):
-            return
-        popped = db.retrieve_held(held[0]["id"])
-        if popped is None:
-            self._error("Hold disappeared.")
-            return
-        from core.cart import Cart as _C
-        new_cart = _C.from_json(popped["cart_json"])
-        # Replace contents in-place to preserve self.cart identity for cart_widget
-        self.cart.clear()
-        for ln in new_cart.lines:
-            self.cart.lines.append(ln)
-        self.cart.recompute()
-        self.cart_widget.refresh()
-        self._info("Cart retrieved.")
+        self.cart_widget._on_held_pill_clicked()
 
     def _on_split(self) -> None:
         self._stub("Split tender")
@@ -1186,40 +1304,284 @@ class PaymentWorker(QObject):
         self.finished.emit(resp)
 
 
-# ─── Processing overlay ──────────────────────────────────────────────────────
+# ─── Card payment bottom sheet (slides up from bottom) ───────────────────────
 
-class ProcessingOverlay(QDialog):
-    """Modal "please wait" dialog shown while a payment is in flight."""
+SHEET_HEIGHT_RATIO = 0.35
+SHEET_ANIM_MS = 300
+DOT_TICK_MS = 400
 
-    def __init__(self, parent: Optional[QWidget], message: str):
+
+class CardPaymentSheet(QFrame):
+    """Bottom-sheet card payment popup. Lives as a child of the parent register.
+
+    States: processing → approved | declined | timeout | error.
+    Each state mutates labels / bg color / action button row.
+    """
+
+    cancel_requested = pyqtSignal()
+    try_again_clicked = pyqtSignal()
+    accept_cash_clicked = pyqtSignal()
+
+    def __init__(self, parent: QWidget):
         super().__init__(parent)
-        self.setObjectName("processing_overlay")
-        self.setModal(True)
-        self.setWindowTitle("Processing")
-        self.setMinimumSize(420, 200)
-        self.setWindowFlags(
-            Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint
-        )
+        self.setObjectName("card_payment_sheet")
+        self._build()
+        self._slide_anim: Optional[QPropertyAnimation] = None
+        self.hide()
+
+    def _build(self) -> None:
+        self.setStyleSheet(self._qss(styles.COLORS["navy"]))
 
         v = QVBoxLayout(self)
-        v.setContentsMargins(32, 32, 32, 32)
-        v.setSpacing(16)
-        v.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        v.setContentsMargins(40, 16, 40, 16)
+        v.setSpacing(6)
 
-        title = QLabel(message)
-        title.setObjectName("processing_overlay_title")
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._top_label = QLabel("WAITING FOR CUSTOMER")
+        self._top_label.setObjectName("sheet_top_label")
+        self._top_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        f = QFont(styles.FONT_FAMILY, 11); f.setBold(True)
+        self._top_label.setFont(f)
+        self._top_label.setStyleSheet(
+            "color: #B8C5D6; background: transparent; letter-spacing: 2px;"
+        )
+        v.addWidget(self._top_label)
+
+        self._amount_label = QLabel("$0.00")
+        self._amount_label.setObjectName("sheet_amount")
+        self._amount_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        af = QFont(styles.FONT_FAMILY, 36); af.setBold(True)
+        self._amount_label.setFont(af)
+        self._amount_label.setStyleSheet("color: white; background: transparent;")
+        v.addWidget(self._amount_label)
+
+        self._subtitle = QLabel("Please tap, insert or swipe card")
+        self._subtitle.setObjectName("sheet_subtitle")
+        self._subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._subtitle.setFont(QFont(styles.FONT_FAMILY, 12))
+        self._subtitle.setStyleSheet(
+            "color: #B8C5D6; background: transparent;"
+        )
+        v.addWidget(self._subtitle)
+
+        self._dots_label = QLabel("•••")
+        self._dots_label.setObjectName("sheet_dots")
+        self._dots_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        df = QFont(styles.FONT_FAMILY, 22); df.setBold(True)
+        self._dots_label.setFont(df)
+        self._dots_label.setStyleSheet("color: white; background: transparent;")
+        v.addWidget(self._dots_label)
+
+        v.addStretch(1)
+
+        # Action row — swappable per state
+        self._action_holder = QFrame()
+        self._action_holder.setStyleSheet("background: transparent;")
+        self._action_layout = QHBoxLayout(self._action_holder)
+        self._action_layout.setContentsMargins(0, 0, 0, 0)
+        self._action_layout.setSpacing(8)
+        v.addWidget(self._action_holder)
+
+        # Default action: CANCEL full width
+        self._cancel_btn = self._mk_action_btn(
+            "CANCEL", "sheet_cancel", styles.COLORS["btn_cancel"]
+        )
+        self._cancel_btn.clicked.connect(self.cancel_requested.emit)
+        self._action_layout.addWidget(self._cancel_btn)
+
+        # Hidden timeout buttons (lazy-shown)
+        self._try_again_btn: Optional[QPushButton] = None
+        self._accept_cash_btn: Optional[QPushButton] = None
+
+        # Cycling-dots timer
+        self._dot_timer = QTimer(self)
+        self._dot_timer.setInterval(DOT_TICK_MS)
+        self._dot_timer.timeout.connect(self._tick_dots)
+        self._dot_state = 0
+
+    @staticmethod
+    def _qss(bg_color: str) -> str:
+        return (
+            f"QFrame#card_payment_sheet {{ background-color: {bg_color};"
+            f" border-top: 2px solid white; }}"
+        )
+
+    def _mk_action_btn(self, text: str, name: str, color: str) -> QPushButton:
+        b = QPushButton(text)
+        b.setObjectName(name)
+        b.setMinimumHeight(50)
+        f = QFont(styles.FONT_FAMILY, 14); f.setBold(True)
+        b.setFont(f)
+        b.setStyleSheet(
+            f"QPushButton {{ background-color: {color}; color: white;"
+            f" border: none; border-radius: 6px; }}"
+            f"QPushButton:disabled {{ background-color: #555; color: #999; }}"
+        )
+        return b
+
+    # ─── State transitions ───────────────────────────────────────────────────
+
+    def show_processing(self, amount_cents: int) -> None:
+        self.setStyleSheet(self._qss(styles.COLORS["navy"]))
+        self._amount_label.setText(f"${amount_cents / 100:.2f}")
+        self._top_label.setText("WAITING FOR CUSTOMER")
+        f = QFont(styles.FONT_FAMILY, 11); f.setBold(True)
+        self._top_label.setFont(f)
+        self._top_label.setStyleSheet(
+            "color: #B8C5D6; background: transparent; letter-spacing: 2px;"
+        )
+        self._subtitle.setText("Please tap, insert or swipe card")
+        self._dots_label.show()
+        self._dots_label.setText("•••")
+        self._dot_state = 0
+        self._dot_timer.start()
+        self._reset_action_row(showing="cancel")
+        self._cancel_btn.setEnabled(True)
+        self._cancel_btn.setText("CANCEL")
+        self.slide_in()
+
+    def lock_cancel(self) -> None:
+        self._cancel_btn.setEnabled(False)
+        self._cancel_btn.setText("Transaction in progress…")
+
+    def show_approved(self) -> None:
+        self.setStyleSheet(self._qss(styles.COLORS["btn_cash"]))
+        self._top_label.setText("✓ APPROVED")
         f = QFont(styles.FONT_FAMILY, 18); f.setBold(True)
-        title.setFont(f)
-        title.setStyleSheet(f"color: {styles.COLORS['navy']};")
-        v.addWidget(title)
+        self._top_label.setFont(f)
+        self._top_label.setStyleSheet("color: white; background: transparent; letter-spacing: 2px;")
+        self._subtitle.setText("Transaction complete")
+        self._dots_label.hide()
+        self._dot_timer.stop()
 
-        sub = QLabel("Awaiting terminal response…")
-        sub.setObjectName("processing_overlay_sub")
-        sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        sub.setFont(QFont(styles.FONT_FAMILY, 12))
-        sub.setStyleSheet(f"color: {styles.COLORS['text_muted']};")
-        v.addWidget(sub)
+    def show_declined(self) -> None:
+        self.setStyleSheet(self._qss(styles.COLORS["btn_cancel"]))
+        self._top_label.setText("✗ DECLINED")
+        f = QFont(styles.FONT_FAMILY, 18); f.setBold(True)
+        self._top_label.setFont(f)
+        self._top_label.setStyleSheet("color: white; background: transparent; letter-spacing: 2px;")
+        self._subtitle.setText("Card was not accepted")
+        self._dots_label.hide()
+        self._dot_timer.stop()
+
+    def show_timeout(self) -> None:
+        self.setStyleSheet(self._qss(styles.COLORS["warning"]))
+        self._top_label.setText("⚠ TERMINAL NOT RESPONDING")
+        f = QFont(styles.FONT_FAMILY, 14); f.setBold(True)
+        self._top_label.setFont(f)
+        self._top_label.setStyleSheet("color: white; background: transparent; letter-spacing: 2px;")
+        self._subtitle.setText("Try again or accept cash")
+        self._dots_label.hide()
+        self._dot_timer.stop()
+        self._reset_action_row(showing="timeout")
+
+    def show_error(self, msg: str) -> None:
+        self.setStyleSheet(self._qss(styles.COLORS["btn_cancel"]))
+        self._top_label.setText("⚠ PAYMENT ERROR")
+        f = QFont(styles.FONT_FAMILY, 14); f.setBold(True)
+        self._top_label.setFont(f)
+        self._subtitle.setText(msg)
+        self._dots_label.hide()
+        self._dot_timer.stop()
+
+    def _reset_action_row(self, showing: str) -> None:
+        # Strip current widgets
+        while self._action_layout.count():
+            item = self._action_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.hide()
+
+        if showing == "cancel":
+            self._action_layout.addWidget(self._cancel_btn)
+            self._cancel_btn.show()
+        elif showing == "timeout":
+            if self._try_again_btn is None:
+                self._try_again_btn = self._mk_action_btn(
+                    "Try Again", "sheet_try_again", styles.COLORS["btn_hold"]
+                )
+                self._try_again_btn.clicked.connect(self.try_again_clicked.emit)
+            if self._accept_cash_btn is None:
+                self._accept_cash_btn = self._mk_action_btn(
+                    "Accept Cash", "sheet_accept_cash", styles.COLORS["btn_cash"]
+                )
+                self._accept_cash_btn.clicked.connect(self.accept_cash_clicked.emit)
+            self._action_layout.addWidget(self._try_again_btn)
+            self._action_layout.addWidget(self._accept_cash_btn)
+            self._try_again_btn.show()
+            self._accept_cash_btn.show()
+
+    def _tick_dots(self) -> None:
+        states = ["•   ", "••  ", "••• ", "••••"]
+        self._dots_label.setText(states[self._dot_state % 4])
+        self._dot_state += 1
+
+    # ─── Slide animation ─────────────────────────────────────────────────────
+
+    def slide_in(self) -> None:
+        parent = self.parentWidget()
+        if parent is None:
+            self.show()
+            return
+        pw, ph = parent.width(), parent.height()
+        sheet_h = max(220, int(ph * SHEET_HEIGHT_RATIO))
+        self.setGeometry(0, ph, pw, sheet_h)
+        self.show()
+        self.raise_()
+        anim = QPropertyAnimation(self, b"geometry", self)
+        anim.setDuration(SHEET_ANIM_MS)
+        anim.setStartValue(QRect(0, ph, pw, sheet_h))
+        anim.setEndValue(QRect(0, ph - sheet_h, pw, sheet_h))
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        anim.start()
+        self._slide_anim = anim
+
+    def slide_out(self) -> None:
+        parent = self.parentWidget()
+        if parent is None:
+            self.hide()
+            return
+        pw, ph = parent.width(), parent.height()
+        sheet_h = self.height() or max(220, int(ph * SHEET_HEIGHT_RATIO))
+        anim = QPropertyAnimation(self, b"geometry", self)
+        anim.setDuration(SHEET_ANIM_MS)
+        anim.setStartValue(self.geometry())
+        anim.setEndValue(QRect(0, ph, pw, sheet_h))
+        anim.setEasingCurve(QEasingCurve.Type.InCubic)
+        anim.finished.connect(self._after_slide_out)
+        anim.start()
+        self._slide_anim = anim
+
+    def _after_slide_out(self) -> None:
+        self._dot_timer.stop()
+        self.hide()
+
+
+# ─── Toast notification (auto-dismissing bottom-right pill) ──────────────────
+
+class Toast(QLabel):
+    """Quick-flash notification. Auto-deletes after `show_for(ms)`."""
+
+    def __init__(self, parent: QWidget, message: str, *, danger: bool = False):
+        super().__init__(message, parent)
+        bg = styles.COLORS["btn_cancel"] if danger else styles.COLORS["btn_cash"]
+        self.setObjectName("toast_danger" if danger else "toast_ok")
+        self.setStyleSheet(
+            f"QLabel {{ background-color: {bg}; color: white;"
+            f" border-radius: 8px; padding: 12px 24px;"
+            f" font-weight: bold; font-size: 13pt; }}"
+        )
+        self.adjustSize()
+
+    def show_for(self, ms: int) -> None:
+        parent = self.parentWidget()
+        if parent is not None:
+            pw, ph = parent.width(), parent.height()
+            x = pw - self.width() - 24
+            y = ph - self.height() - 80
+            self.move(x, y)
+        self.show()
+        self.raise_()
+        QTimer.singleShot(ms, self.deleteLater)
 
 
 # ─── Change dialog ───────────────────────────────────────────────────────────

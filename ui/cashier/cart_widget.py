@@ -23,6 +23,7 @@ from typing import Optional
 from PyQt6.QtCore import QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
+    QDialog,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -34,6 +35,8 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+from core import db
 
 from core.cart import Cart
 from core.logger import get_logger
@@ -110,10 +113,13 @@ class CartRow(QWidget):
         h.setContentsMargins(10, 6, 10, 6)
         h.setSpacing(8)
 
-        # Name (always visible, stretches)
+        # Name (always visible, stretches) — dark text
         self._name_lbl = QLabel(line.name)
         self._name_lbl.setObjectName("cart_row_name")
         self._name_lbl.setFont(QFont(styles.FONT_FAMILY, 13))
+        self._name_lbl.setStyleSheet(
+            f"color: {styles.COLORS['text_dark']}; background: transparent;"
+        )
         h.addWidget(self._name_lbl, stretch=1)
 
         # Static cluster: qty + unit + (discount) + total
@@ -122,17 +128,26 @@ class CartRow(QWidget):
         sh = QHBoxLayout(self._static)
         sh.setContentsMargins(0, 0, 0, 0); sh.setSpacing(8)
 
+        # qty — blue bold
         self._qty_lbl = QLabel(f"{line.quantity}x")
         self._qty_lbl.setObjectName("cart_row_qty")
         self._qty_lbl.setMinimumWidth(36)
         self._qty_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        qf = QFont(styles.FONT_FAMILY, 13); qf.setBold(True)
+        self._qty_lbl.setFont(qf)
+        self._qty_lbl.setStyleSheet(
+            f"color: {styles.COLORS['blue_mid']}; background: transparent;"
+        )
         sh.addWidget(self._qty_lbl)
 
+        # unit price — muted grey
         self._unit_lbl = QLabel(f"${line.unit_price_cents / 100:.2f}")
         self._unit_lbl.setObjectName("cart_row_unit")
         self._unit_lbl.setMinimumWidth(64)
         self._unit_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self._unit_lbl.setStyleSheet(f"color: {styles.COLORS['text_muted']}; background: transparent;")
+        self._unit_lbl.setStyleSheet(
+            f"color: {styles.COLORS['text_muted']}; background: transparent;"
+        )
         sh.addWidget(self._unit_lbl)
 
         if line.deal_discount_cents > 0:
@@ -143,12 +158,16 @@ class CartRow(QWidget):
             disc.setStyleSheet(f"color: {styles.COLORS['btn_cash']}; font-weight: bold; background: transparent;")
             sh.addWidget(disc)
 
+        # line total — dark bold
         self._total_lbl = QLabel(f"${line.line_total_cents / 100:.2f}")
         self._total_lbl.setObjectName("cart_row_total")
         self._total_lbl.setMinimumWidth(80)
         self._total_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         tf = QFont(styles.FONT_FAMILY, 13); tf.setBold(True)
         self._total_lbl.setFont(tf)
+        self._total_lbl.setStyleSheet(
+            f"color: {styles.COLORS['text_dark']}; background: transparent;"
+        )
         sh.addWidget(self._total_lbl)
 
         h.addWidget(self._static)
@@ -223,10 +242,11 @@ class CartRow(QWidget):
             self._static.hide()
             self._qty_in_ctrl.setText(str(self.line.quantity))
             self._controls.show()
-            # Slightly tinted bg for selected
+            # Navy bg + white text for clear, readable selection state
             self.setStyleSheet(
-                f"CartRow {{ background-color: {styles.COLORS['blue_light']}; }}"
-                f" QLabel {{ color: white; background: transparent; }}"
+                f"CartRow {{ background-color: {styles.COLORS['blue_mid']}; }}"
+                f" QLabel {{ color: white; background: transparent;"
+                f"           font-style: normal; }}"
             )
         else:
             self._controls.hide()
@@ -234,9 +254,23 @@ class CartRow(QWidget):
             self._apply_tint(self.line)
 
     def flash_added(self) -> None:
-        """Flash green bg for FLASH_MS then revert to natural tint."""
+        """Flash green bg for FLASH_MS then revert to natural tint.
+
+        Uses a QTimer parented to `self` so it's auto-deleted with the row
+        if the cart is rebuilt before the timer fires (no stale callback).
+        """
         self.setStyleSheet(f"CartRow {{ background-color: {ROW_BG_FLASH}; }}")
-        QTimer.singleShot(FLASH_MS, lambda: self._apply_tint(self.line) if not self._selected else None)
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.timeout.connect(self._restore_tint_safe)
+        timer.start(FLASH_MS)
+
+    def _restore_tint_safe(self) -> None:
+        try:
+            if not self._selected:
+                self._apply_tint(self.line)
+        except RuntimeError:
+            pass   # underlying C++ row already deleted; ignore
 
 
 # ─── Totals breakdown panel ──────────────────────────────────────────────────
@@ -308,11 +342,15 @@ class TotalsPanel(QWidget):
 # ─── Main widget ─────────────────────────────────────────────────────────────
 
 class CartWidget(QWidget):
-    """Live cart view with inline row controls + big TOTAL header."""
+    """Live cart view: one bordered box containing TOTAL header → list →
+    breakdown → Hold|Cancel."""
 
     item_selected = pyqtSignal(object)   # CartItem | None
     qty_changed = pyqtSignal(int)        # new qty
     item_removed = pyqtSignal()
+    hold_clicked = pyqtSignal()
+    cancel_clicked = pyqtSignal()
+    restore_held_requested = pyqtSignal(int)   # held_id
 
     def __init__(self, cart: Cart, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -323,33 +361,111 @@ class CartWidget(QWidget):
         self.refresh()
 
     def _build_ui(self) -> None:
-        root = QVBoxLayout(self)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(0)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(2)
 
-        # Big TOTAL header
+        # ── HELD pill (above the box, top-right; hidden when count == 0) ──
+        held_row = QFrame()
+        held_row.setObjectName("held_row")
+        held_row.setStyleSheet("QFrame#held_row { background: transparent; }")
+        held_row.setFixedHeight(28)
+        hr = QHBoxLayout(held_row)
+        hr.setContentsMargins(0, 0, 0, 0); hr.setSpacing(0)
+        hr.addStretch(1)
+        self._held_pill = QPushButton("🔖 HELD (0)")
+        self._held_pill.setObjectName("held_pill")
+        self._held_pill.setMinimumHeight(24)
+        self._held_pill.setMaximumHeight(24)
+        pf = QFont(styles.FONT_FAMILY, 10); pf.setBold(True)
+        self._held_pill.setFont(pf)
+        self._held_pill.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._held_pill.setStyleSheet(
+            f"QPushButton#held_pill {{ background-color: {styles.COLORS['navy']};"
+            f" color: white; border: none; border-radius: 12px;"
+            f" padding: 2px 14px; }}"
+            f"QPushButton#held_pill:hover {{ background-color: {styles.COLORS['blue_mid']}; }}"
+        )
+        self._held_pill.clicked.connect(self._on_held_pill_clicked)
+        self._held_pill.hide()
+        hr.addWidget(self._held_pill)
+        outer.addWidget(held_row)
+
+        # Single bordered container — all cart pieces live inside
+        box = QFrame()
+        box.setObjectName("cart_box")
+        box.setStyleSheet(
+            "QFrame#cart_box { background-color: white;"
+            " border: 1px solid #B0BEC5; border-radius: 6px; }"
+        )
+        v = QVBoxLayout(box)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(0)
+
+        # TOTAL header (top)
         self.total_header = CartTotalHeader()
-        root.addWidget(self.total_header)
+        v.addWidget(self.total_header)
 
-        # Cart list
+        # Cart list (stretch)
         self._list = QListWidget()
         self._list.setObjectName("cart")
         self._list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
         self._list.itemSelectionChanged.connect(self._on_selection_changed)
         self._list.setStyleSheet(
             f"QListWidget#cart {{ background-color: {CART_BG};"
-            f" border: 1px solid #C8D0E0; }}"
+            f" border: none; }}"
             f"QListWidget#cart::item {{ border: none; padding: 0; }}"
             f"QListWidget#cart::item:selected {{ background: transparent; }}"
         )
-        root.addWidget(self._list, stretch=1)
+        v.addWidget(self._list, stretch=1)
 
-        # Totals breakdown panel
+        # Tax breakdown
         self.totals_panel = TotalsPanel()
         self.totals_panel.setStyleSheet(
-            "QWidget#totals_panel { background-color: white; border-top: 1px solid #C8D0E0; }"
+            "QWidget#totals_panel { background-color: white;"
+            " border-top: 1px solid #C8D0E0; }"
         )
-        root.addWidget(self.totals_panel)
+        v.addWidget(self.totals_panel)
+
+        # Hold | Cancel (very bottom inside the box)
+        bottom = QFrame()
+        bottom.setObjectName("cart_bottom_actions")
+        bottom.setStyleSheet(
+            "QFrame#cart_bottom_actions { background-color: white;"
+            " border-top: 1px solid #C8D0E0; }"
+        )
+        bh = QHBoxLayout(bottom)
+        bh.setContentsMargins(8, 6, 8, 8)
+        bh.setSpacing(8)
+
+        b_hold = self._mk_bottom_btn(
+            "Hold", "act_hold_left", styles.COLORS["btn_hold"]
+        )
+        b_hold.clicked.connect(self.hold_clicked.emit)
+        bh.addWidget(b_hold)
+
+        b_cancel = self._mk_bottom_btn(
+            "Cancel", "act_cancel_left", styles.COLORS["btn_cancel"]
+        )
+        b_cancel.clicked.connect(self.cancel_clicked.emit)
+        bh.addWidget(b_cancel)
+
+        v.addWidget(bottom)
+
+        outer.addWidget(box)
+
+    @staticmethod
+    def _mk_bottom_btn(text: str, name: str, color: str) -> QPushButton:
+        b = QPushButton(text)
+        b.setObjectName(name)
+        b.setMinimumHeight(50)
+        f = QFont(styles.FONT_FAMILY, 13); f.setBold(True)
+        b.setFont(f)
+        b.setStyleSheet(
+            f"QPushButton {{ background-color: {color}; color: white;"
+            f" border: none; border-radius: 6px; padding: 8px 16px; }}"
+        )
+        return b
 
     # ─── Refresh / sync ──────────────────────────────────────────────────────
 
@@ -459,3 +575,81 @@ class CartWidget(QWidget):
     def clear_selection(self) -> None:
         self._list.clearSelection()
         self._selected_index = None
+
+    # ─── HELD pill ───────────────────────────────────────────────────────────
+
+    def update_held_count(self, count: int) -> None:
+        """Show/update the held-cart pill above the cart panel."""
+        if count > 0:
+            self._held_pill.setText(f"🔖 HELD ({count})")
+            self._held_pill.show()
+        else:
+            self._held_pill.hide()
+
+    def _on_held_pill_clicked(self) -> None:
+        held = db.list_held()
+        if not held:
+            self.update_held_count(0)
+            return
+        dlg = HeldPickerDialog(held, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted and dlg.selected_id is not None:
+            self.restore_held_requested.emit(dlg.selected_id)
+
+
+# ─── Held cart picker dialog ─────────────────────────────────────────────────
+
+class HeldPickerDialog(QDialog):
+    """Modal list of held carts. Emits selected id on accept."""
+
+    def __init__(self, held_rows: list[dict], parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.setObjectName("held_picker_dialog")
+        self.setWindowTitle("Held Carts")
+        self.setMinimumSize(420, 360)
+        self.selected_id: Optional[int] = None
+
+        v = QVBoxLayout(self)
+        v.setContentsMargins(16, 16, 16, 16)
+        v.setSpacing(10)
+
+        title = QLabel(f"{len(held_rows)} held cart(s) — select one to retrieve")
+        title.setObjectName("held_picker_title")
+        tf = QFont(styles.FONT_FAMILY, 12); tf.setBold(True)
+        title.setFont(tf)
+        v.addWidget(title)
+
+        self._list = QListWidget()
+        self._list.setObjectName("held_list")
+        self._list.itemDoubleClicked.connect(lambda _: self._accept())
+        for row in held_rows:
+            label = row.get("hold_label") or "(unlabelled)"
+            cashier = row.get("cashier_name") or "?"
+            ts = row.get("created_at") or ""
+            display = f"#{row['id']}  ·  {label}  ·  {cashier}  ·  {ts}"
+            item = QListWidgetItem(display)
+            item.setData(Qt.ItemDataRole.UserRole, row["id"])
+            self._list.addItem(item)
+        if self._list.count() > 0:
+            self._list.setCurrentRow(0)
+        v.addWidget(self._list, stretch=1)
+
+        h = QHBoxLayout(); h.setSpacing(8)
+        cancel = QPushButton("Cancel"); cancel.setObjectName("held_picker_cancel")
+        cancel.clicked.connect(self.reject)
+        h.addWidget(cancel)
+        ok = QPushButton("Retrieve"); ok.setObjectName("held_picker_ok")
+        ok.setStyleSheet(
+            f"QPushButton {{ background-color: {styles.COLORS['btn_cash']}; color: white;"
+            f" border: none; border-radius: 6px; padding: 8px 24px; font-weight: bold; }}"
+        )
+        ok.clicked.connect(self._accept)
+        ok.setDefault(True)
+        h.addWidget(ok)
+        v.addLayout(h)
+
+    def _accept(self) -> None:
+        item = self._list.currentItem()
+        if item is None:
+            return
+        self.selected_id = int(item.data(Qt.ItemDataRole.UserRole))
+        self.accept()
