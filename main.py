@@ -46,6 +46,8 @@ from core import db, tax
 from core.cart import Cart
 from core.logger import get_logger, setup_logger
 from core.models import User
+from core.payment.base import PaymentTerminal
+from core.payment.detector import get_terminal
 
 from ui import styles
 from ui.cashier.numpad import MODE_PRICE, Numpad
@@ -238,12 +240,13 @@ class MainWindow(QMainWindow):
 
         self.config = config
         self.store_name: str = config.get("store", {}).get("name", "CityLink Convenience")
-        # In Phase 1 we have only mock terminal; treat real terminal types as connected once detector exists.
-        terminal_type = config.get("payment", {}).get("terminal_type", "mock")
-        self.terminal_connected: bool = terminal_type not in ("mock", None, "")
         self.inactivity_seconds: int = int(
             config.get("features", {}).get("inactivity_timeout_seconds", 120)
         )
+
+        # Build payment terminal once at app startup (mock / ingenico / pax).
+        # Returned regardless of connect outcome — UI inspects is_connected().
+        self.terminal: PaymentTerminal = get_terminal(config)
 
         self.setStyleSheet(styles.get_stylesheet())
 
@@ -314,7 +317,7 @@ class MainWindow(QMainWindow):
             cashier=self._current_user,
             shift_id=self._current_shift_id,
             store_name=self.store_name,
-            terminal_connected=self.terminal_connected,
+            terminal=self.terminal,
         )
         self._register.logout_requested.connect(self._on_logout)
         self._register.admin_requested.connect(self._on_admin_requested)
@@ -402,6 +405,14 @@ class MainWindow(QMainWindow):
         ):
             self._mark_activity()
         return super().event(ev)
+
+    def closeEvent(self, event) -> None:
+        try:
+            if self.terminal is not None:
+                self.terminal.disconnect()
+        except Exception:
+            log.exception("terminal disconnect on close failed")
+        super().closeEvent(event)
 
 
 # ─── Entry point ─────────────────────────────────────────────────────────────

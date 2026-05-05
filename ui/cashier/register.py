@@ -25,7 +25,7 @@ from __future__ import annotations
 import time as _time
 from typing import Optional
 
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QObject, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont, QKeyEvent
 from PyQt6.QtWidgets import (
     QDialog,
@@ -47,6 +47,14 @@ from core.cart import Cart
 from core.departments import DEPT_BY_ID
 from core.logger import get_logger
 from core.models import CartItem, Transaction, User
+from core.payment.base import (
+    PaymentRequest,
+    PaymentResponse,
+    PaymentTerminal,
+    RESULT_DECLINED,
+    RESULT_TIMEOUT,
+)
+from core.payment.detector import is_mock
 from ui import styles
 from ui.cashier.cart_widget import CartWidget
 from ui.cashier.departments import ALL_ID
@@ -67,7 +75,7 @@ class RegisterScreen(QWidget):
         cashier: User,
         shift_id: Optional[int] = None,
         store_name: str = "CityLink Convenience",
-        terminal_connected: bool = False,
+        terminal: Optional[PaymentTerminal] = None,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -76,8 +84,14 @@ class RegisterScreen(QWidget):
         self.cashier = cashier
         self.shift_id = shift_id
         self.store_name = store_name
-        self._terminal_connected = terminal_connected
+        self.terminal: Optional[PaymentTerminal] = terminal
         self._barcode_buffer = ""
+
+        # Card payment state (QThread + worker held during a transaction)
+        self._payment_thread: Optional[QThread] = None
+        self._payment_worker: Optional["PaymentWorker"] = None
+        self._processing_overlay: Optional["ProcessingOverlay"] = None
+        self._pending_card_req: Optional[PaymentRequest] = None
 
         self._build_ui()
         self._wire_clock()
@@ -140,14 +154,14 @@ class RegisterScreen(QWidget):
         self._clock_label.setStyleSheet("color: white;")
         self._update_clock()
 
-        self._terminal_dot = QLabel("● TCP" if self._terminal_connected else "● CASH-ONLY")
+        # Header dot reflects terminal state:
+        #   green "● TCP"    = real terminal connected
+        #   orange "● MOCK"  = mock terminal connected (test mode)
+        #   red    "● CASH-ONLY" = no terminal / disconnected
+        self._terminal_dot = QLabel()
         self._terminal_dot.setObjectName("hdr_terminal_dot")
         self._terminal_dot.setFont(QFont(styles.FONT_FAMILY, 11))
-        ok = self._terminal_connected
-        self._terminal_dot.setStyleSheet(
-            f"color: {styles.COLORS['success'] if ok else styles.COLORS['warning']};"
-            f"font-weight: bold;"
-        )
+        self._refresh_terminal_dot()
 
         h.addWidget(title)
         h.addWidget(store)
@@ -223,6 +237,7 @@ class RegisterScreen(QWidget):
 
         v.addWidget(self._build_tabs_bar())
         v.addWidget(self._build_dept_tiles())
+        v.addWidget(self._build_separator())
         v.addWidget(self._build_search_bar())
 
         # NRS numpad+action grid
@@ -234,9 +249,52 @@ class RegisterScreen(QWidget):
         self._numpad_display.hide()
 
         v.addWidget(self._build_numpad_grid())
+        sec = self._build_sec_rows()
+        sec.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        v.addWidget(sec, stretch=1)   # absorbs leftover vertical space, white bg fills gap
         v.addWidget(self._build_info_bar())
-        v.addStretch(1)
         return panel
+
+    # ─── Secondary action rows (Hold / Cancel / Clear / Override / Price Check) ──
+
+    def _build_sec_rows(self) -> QWidget:
+        container = QFrame()
+        container.setObjectName("sec_rows_container")
+        container.setStyleSheet("QFrame#sec_rows_container { background-color: white; }")
+        v = QVBoxLayout(container)
+        v.setSpacing(3)
+        v.setContentsMargins(2, 4, 2, 2)
+
+        # Row A: Hold / Retrieve / No Sale
+        h1 = QHBoxLayout(); h1.setSpacing(3)
+        for label, name, color_key, slot in [
+            ("Hold",     "act_hold",     "btn_hold",    self._on_hold),
+            ("Retrieve", "act_retrieve", "btn_hold",    self._on_retrieve),
+            ("No Sale",  "act_no_sale",  "btn_no_sale", self._on_no_sale),
+        ]:
+            b = self._mk_action(label, name, color_key, height=40)
+            b.clicked.connect(slot)
+            h1.addWidget(b)
+        v.addLayout(h1)
+
+        # Row B: Cancel Item / Clear Cart / Override Price
+        h2 = QHBoxLayout(); h2.setSpacing(3)
+        for label, name, color_key, slot in [
+            ("Cancel Item",    "act_cancel_item",    "btn_cancel", self._on_cancel_item),
+            ("Clear Cart",     "act_clear_cart",     "btn_void",   self._on_clear_cart),
+            ("Override Price", "act_override_price", "btn_void",   self._on_override_price),
+        ]:
+            b = self._mk_action(label, name, color_key, height=40)
+            b.clicked.connect(slot)
+            h2.addWidget(b)
+        v.addLayout(h2)
+
+        # Row C: Price Check full width
+        pc = self._mk_action("Price Check", "act_price_check", "btn_hold", height=40)
+        pc.clicked.connect(self._on_price_check)
+        v.addWidget(pc)
+
+        return container
 
     # ─── Top tabs ────────────────────────────────────────────────────────────
 
@@ -280,7 +338,8 @@ class RegisterScreen(QWidget):
     def _build_dept_tiles(self) -> QWidget:
         container = QFrame()
         container.setObjectName("dept_tiles")
-        container.setStyleSheet("QFrame#dept_tiles { background-color: white; }")
+        # Light grey background distinguishes dept area from white numpad area
+        container.setStyleSheet("QFrame#dept_tiles { background-color: #E8E8E8; }")
         grid = QGridLayout(container)
         grid.setSpacing(8)
         grid.setContentsMargins(8, 4, 8, 8)
@@ -291,8 +350,8 @@ class RegisterScreen(QWidget):
             r, c = divmod(i, 6)
             b = QPushButton(label)
             b.setObjectName(f"nrs_dept_{i}")
-            b.setMinimumHeight(65)
-            b.setMaximumHeight(65)
+            b.setMinimumHeight(52)
+            b.setMaximumHeight(52)
             b.setStyleSheet(
                 f"QPushButton {{ background-color: {color}; color: white;"
                 f" border: 1px solid #888; border-radius: 4px;"
@@ -307,16 +366,25 @@ class RegisterScreen(QWidget):
         # Empty cells fill row 2 to slot 11
         for slot in range(len(self.NRS_DEPT_TILES), 12):
             r, c = divmod(slot, 6)
-            grid.addWidget(self._empty_tile(65), r, c)
+            grid.addWidget(self._empty_tile(52, bg="#E8E8E8"), r, c)
 
         return container
 
-    def _empty_tile(self, height: int) -> QWidget:
+    def _empty_tile(self, height: int, *, bg: str = "white") -> QWidget:
         w = QWidget()
         w.setMinimumHeight(height)
         w.setMaximumHeight(height)
-        w.setStyleSheet("background-color: white;")
+        w.setStyleSheet(f"background-color: {bg};")
         return w
+
+    def _build_separator(self) -> QWidget:
+        """Thin horizontal separator line between dept area and search bar."""
+        line = QFrame()
+        line.setObjectName("dept_search_separator")
+        line.setFrameShape(QFrame.Shape.HLine)
+        line.setFixedHeight(1)
+        line.setStyleSheet("background-color: #999;")
+        return line
 
     # ─── NRS numpad + action grid ────────────────────────────────────────────
 
@@ -339,14 +407,14 @@ class RegisterScreen(QWidget):
         def mk_digit(text: str, name: str) -> QPushButton:
             b = QPushButton(text)
             b.setObjectName(name)
-            b.setMinimumHeight(70); b.setMaximumHeight(70)
+            b.setMinimumHeight(46); b.setMaximumHeight(46)
             b.setStyleSheet(DIGIT_QSS)
             return b
 
         def mk_act(text: str, name: str, color: str, *, font_pt: int = 11) -> QPushButton:
             b = QPushButton(text)
             b.setObjectName(name)
-            b.setMinimumHeight(70); b.setMaximumHeight(70)
+            b.setMinimumHeight(46); b.setMaximumHeight(46)
             b.setStyleSheet(
                 f"QPushButton {{ background-color: {color}; color: white;"
                 f" border: none; font-weight: bold; font-size: {font_pt}pt; }}"
@@ -372,7 +440,7 @@ class RegisterScreen(QWidget):
             grid.addWidget(b, 1, i)
         b = mk_act("$5", "act_cash_5", "#F39C12", font_pt=14)
         b.clicked.connect(lambda: self._on_cash_shortcut(500)); grid.addWidget(b, 1, 3)
-        grid.addWidget(self._empty_tile(70), 1, 4)
+        grid.addWidget(self._empty_tile(46), 1, 4)
         b = mk_act("Basket\nDiscount", "act_basket_discount", "#2196F3", font_pt=10)
         b.clicked.connect(lambda: self._stub("Basket Discount"))
         grid.addWidget(b, 1, 5)
@@ -384,7 +452,7 @@ class RegisterScreen(QWidget):
             grid.addWidget(b, 2, i)
         b = mk_act("Credit\nDebit", "act_card", "#E53935", font_pt=11)
         b.clicked.connect(self._on_card); grid.addWidget(b, 2, 3)
-        grid.addWidget(self._empty_tile(70), 2, 4)
+        grid.addWidget(self._empty_tile(46), 2, 4)
         b = mk_act("Cash", "act_cash", "#4CAF50", font_pt=14)
         b.clicked.connect(self._on_cash); grid.addWidget(b, 2, 5)
 
@@ -395,11 +463,11 @@ class RegisterScreen(QWidget):
         b.clicked.connect(lambda _ck=False: self._numpad_input("00")); grid.addWidget(b, 3, 1)
         at_btn = mk_digit("@", "npd_btn_at")
         grid.addWidget(at_btn, 3, 2)
-        grid.addWidget(self._empty_tile(70), 3, 3)
+        grid.addWidget(self._empty_tile(46), 3, 3)
         b = mk_act("Refund", "act_refund", "#E53935", font_pt=12)
         b.clicked.connect(lambda: self._stub("Refund"))
         grid.addWidget(b, 3, 4)
-        grid.addWidget(self._empty_tile(70), 3, 5)
+        grid.addWidget(self._empty_tile(46), 3, 5)
 
         return container
 
@@ -653,9 +721,26 @@ class RegisterScreen(QWidget):
     def _wire_signals(self) -> None:
         # NRS dept tile clicks are wired directly in _build_dept_tiles().
         # No DepartmentGrid widget in the NRS-style layout.
+        pass
 
     def _update_clock(self) -> None:
         self._clock_label.setText(_time.strftime("%-I:%M %p", _time.localtime()))
+
+    def _refresh_terminal_dot(self) -> None:
+        if self.terminal is not None and self.terminal.is_connected():
+            if is_mock(self.terminal):
+                text = "● MOCK"
+                color = styles.COLORS["warning"]   # orange
+            else:
+                text = "● TCP"
+                color = styles.COLORS["success"]   # green
+        else:
+            text = "● CASH-ONLY"
+            color = styles.COLORS["danger"]        # red
+        self._terminal_dot.setText(text)
+        self._terminal_dot.setStyleSheet(
+            f"color: {color}; font-weight: bold;"
+        )
 
     # ─── barcode ─────────────────────────────────────────────────────────────
 
@@ -795,10 +880,126 @@ class RegisterScreen(QWidget):
         dlg.exec()
 
     def _on_card(self) -> None:
-        if self._terminal_connected:
-            self._info("Card flow not wired in this checkpoint. Coming step 14-17.")
+        if self.cart.is_empty():
+            self._info("Cart is empty.")
+            return
+        if self.terminal is None or not self.terminal.is_connected():
+            self._error("Card terminal not connected (cash-only mode).")
+            return
+        if self._payment_thread is not None:
+            self._info("Payment already in progress.")
+            return
+
+        # Card uses exact total (no cash rounding)
+        amount = self.cart.totals["total_cents"]
+        if amount <= 0:
+            self._error("Total is $0 — nothing to charge.")
+            return
+
+        self._pending_card_req = PaymentRequest(
+            amount_cents=amount,
+            transaction_ref=db.next_transaction_ref(),
+        )
+
+        # Modal overlay blocks UI while QThread waits on the terminal
+        self._processing_overlay = ProcessingOverlay(
+            self,
+            f"Processing card... ${amount / 100:.2f}",
+        )
+        self._processing_overlay.show()
+
+        self._payment_thread = QThread(self)
+        self._payment_worker = PaymentWorker(self.terminal, self._pending_card_req)
+        self._payment_worker.moveToThread(self._payment_thread)
+        self._payment_thread.started.connect(self._payment_worker.run)
+        self._payment_worker.finished.connect(self._on_card_response)
+        self._payment_worker.finished.connect(self._payment_thread.quit)
+        self._payment_thread.finished.connect(self._payment_worker.deleteLater)
+        self._payment_thread.finished.connect(self._payment_thread.deleteLater)
+        self._payment_thread.start()
+        log.info("card payment thread started, ref=%s", self._pending_card_req.transaction_ref)
+
+    def _on_card_response(self, resp: PaymentResponse) -> None:
+        # Tear down overlay + thread refs first so UI is responsive immediately
+        if self._processing_overlay is not None:
+            self._processing_overlay.accept()
+            self._processing_overlay = None
+        self._payment_worker = None
+        self._payment_thread = None
+
+        req = self._pending_card_req
+        self._pending_card_req = None
+        if req is None:
+            log.error("card response received with no pending request")
+            return
+
+        if resp.approved:
+            self._finalize_card(req, resp)
+            return
+
+        if resp.result == RESULT_DECLINED:
+            self._error(
+                f"Card Declined — try again\n\n{resp.error_message or ''}"
+            )
+        elif resp.result == RESULT_TIMEOUT:
+            if self._confirm("Terminal timeout.\n\nAccept cash instead?"):
+                self._info(
+                    "Enter cash tender on the numpad, then press Cash."
+                )
         else:
-            self._error("Card terminal not configured (cash-only mode).")
+            self._error(f"Payment error: {resp.error_message or '(no detail)'}")
+
+    def _finalize_card(self, req: PaymentRequest, resp: PaymentResponse) -> None:
+        t = self.cart.totals
+        txn = Transaction(
+            transaction_ref=req.transaction_ref,
+            subtotal_cents=t["subtotal_cents"],
+            discount_cents=t["discount_cents"],
+            gst_cents=t["gst_cents"],
+            pst_cents=t["pst_cents"],
+            deposit_cents=t["deposit_cents"],
+            bag_charge_cents=t["bag_charge_cents"],
+            total_cents=t["total_cents"],
+            rounded_total_cents=t["total_cents"],   # card = exact, no rounding
+            payment_method="card",
+            cash_tendered_cents=0,
+            change_cents=0,
+            card_amount_cents=req.amount_cents,
+            card_auth_code=resp.auth_code,
+            card_last4=resp.card_last4,
+            cashier_id=self.cashier.id,
+            cashier_name=self.cashier.name,
+            shift_id=self.shift_id,
+            items=list(self.cart.lines),
+        )
+        items_data = [ln.to_db_dict() for ln in self.cart.lines]
+        try:
+            tid = db.insert_transaction(txn.header_dict(), items_data)
+        except Exception:
+            log.exception("card transaction insert failed")
+            self._error("Failed to save transaction. See errors.log.")
+            return
+        for ln in self.cart.lines:
+            if ln.kind == "lottery":
+                try:
+                    db.log_lottery(
+                        "sale",
+                        ln.unit_price_cents * ln.quantity,
+                        self.cashier.name,
+                        shift_id=self.shift_id,
+                        transaction_id=tid,
+                        description=ln.name,
+                    )
+                except Exception:
+                    log.exception("lottery_ledger insert failed")
+        self._print_receipt(txn, tid)
+        last4 = resp.card_last4 or "????"
+        self._info(
+            f"APPROVED\n\n{req.transaction_ref}\nAuth: {resp.auth_code}\nCard …{last4}"
+        )
+        self.cart.clear()
+        self._numpad_clear()
+        self.cart_widget.refresh()
 
     def _on_bag(self) -> None:
         self.cart.add_bag_charge()
@@ -955,6 +1156,67 @@ class RegisterScreen(QWidget):
 
     def _stub(self, name: str) -> None:
         self._info(f"{name} — not implemented yet (Phase 1 checkpoint scope).")
+
+
+# ─── Payment worker (runs in QThread) ────────────────────────────────────────
+
+class PaymentWorker(QObject):
+    """Runs `terminal.request_payment(req)` off the UI thread.
+
+    moveToThread the worker onto a fresh QThread; connect `finished` to your
+    UI handler. The worker emits exactly once and is safe to delete after.
+    """
+
+    finished = pyqtSignal(object)   # PaymentResponse
+
+    def __init__(self, terminal: PaymentTerminal, req: PaymentRequest):
+        super().__init__()
+        self.terminal = terminal
+        self.req = req
+
+    def run(self) -> None:
+        try:
+            resp = self.terminal.request_payment(self.req)
+        except Exception as exc:
+            log.exception("payment worker raised")
+            resp = PaymentResponse.error(str(exc))
+        self.finished.emit(resp)
+
+
+# ─── Processing overlay ──────────────────────────────────────────────────────
+
+class ProcessingOverlay(QDialog):
+    """Modal "please wait" dialog shown while a payment is in flight."""
+
+    def __init__(self, parent: Optional[QWidget], message: str):
+        super().__init__(parent)
+        self.setObjectName("processing_overlay")
+        self.setModal(True)
+        self.setWindowTitle("Processing")
+        self.setMinimumSize(420, 200)
+        self.setWindowFlags(
+            Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint
+        )
+
+        v = QVBoxLayout(self)
+        v.setContentsMargins(32, 32, 32, 32)
+        v.setSpacing(16)
+        v.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        title = QLabel(message)
+        title.setObjectName("processing_overlay_title")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        f = QFont(styles.FONT_FAMILY, 18); f.setBold(True)
+        title.setFont(f)
+        title.setStyleSheet(f"color: {styles.COLORS['navy']};")
+        v.addWidget(title)
+
+        sub = QLabel("Awaiting terminal response…")
+        sub.setObjectName("processing_overlay_sub")
+        sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        sub.setFont(QFont(styles.FONT_FAMILY, 12))
+        sub.setStyleSheet(f"color: {styles.COLORS['text_muted']};")
+        v.addWidget(sub)
 
 
 # ─── Change dialog ───────────────────────────────────────────────────────────
