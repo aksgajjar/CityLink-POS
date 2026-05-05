@@ -183,19 +183,19 @@ class RegisterScreen(QWidget):
         return bar
 
     def _build_deals_banner(self) -> QWidget:
-        banner = QFrame()
-        banner.setObjectName("deals_banner")
-        banner.setFixedHeight(28)
-        banner.setStyleSheet(
-            f"background-color: {styles.COLORS['warning']}; color: {styles.COLORS['text_dark']};"
-        )
-        h = QHBoxLayout(banner)
-        h.setContentsMargins(12, 2, 12, 2)
-        lab = QLabel("ACTIVE DEALS — (banner widget will populate this in step 19)")
-        lab.setObjectName("deals_banner_label")
-        lab.setFont(QFont(styles.FONT_FAMILY, 11))
-        h.addWidget(lab)
-        return banner
+        self.deals_banner = DealsBanner()
+        return self.deals_banner
+
+    def _refresh_deals_banner(self) -> None:
+        """Pull active deals + hints; update the banner. Cheap — runs after every cart change."""
+        try:
+            from core.models import Deal as _Deal
+            active = [_Deal.from_row(r) for r in db.list_active_deals()]
+            hints = self.cart.deal_hints(deals=active)
+            triggered_ids = {ln.deal_id for ln in self.cart.lines if ln.deal_id is not None}
+            self.deals_banner.update_deals(active, hints, triggered_ids)
+        except Exception:
+            log.exception("deals banner refresh failed")
 
     # ─── Left panel: cart only (Hold/Cancel live inside cart_widget now) ─────
 
@@ -205,8 +205,13 @@ class RegisterScreen(QWidget):
         self.cart_widget.hold_clicked.connect(self._on_hold)
         self.cart_widget.cancel_clicked.connect(self._on_clear_cart)
         self.cart_widget.restore_held_requested.connect(self._on_restore_held)
-        # Sync the HELD pill with the DB on load
+        # Refresh deals banner whenever the cart changes via inline controls
+        self.cart_widget.qty_changed.connect(lambda _n: self._refresh_deals_banner())
+        self.cart_widget.item_removed.connect(self._refresh_deals_banner)
+        # Sync HELD pill with DB on load
         self._refresh_held_count()
+        # Initial deals-banner population (deferred until banner exists)
+        QTimer.singleShot(0, self._refresh_deals_banner)
         return self.cart_widget
 
     def _refresh_held_count(self) -> None:
@@ -237,6 +242,7 @@ class RegisterScreen(QWidget):
         self.cart.recompute()
         self.cart_widget.refresh()
         self._refresh_held_count()
+        self._refresh_deals_banner()
         self._info("Cart retrieved.")
 
     # ─── Right panel: pixel-perfect NRS clone ────────────────────────────────
@@ -802,6 +808,7 @@ class RegisterScreen(QWidget):
         ln = self.cart.add_item(Item.from_row(row))
         idx = self.cart.lines.index(ln)
         self.cart_widget.refresh(flash_index=idx)
+        self._refresh_deals_banner()
 
     # ─── department / manual entry ───────────────────────────────────────────
 
@@ -821,6 +828,7 @@ class RegisterScreen(QWidget):
         idx = self.cart.lines.index(ln)
         self.cart_widget.refresh(flash_index=idx)
         self._numpad_clear()
+        self._refresh_deals_banner()
 
     # ─── action handlers ─────────────────────────────────────────────────────
 
@@ -896,13 +904,26 @@ class RegisterScreen(QWidget):
         self.cart.clear()
         self._numpad_clear()
         self.cart_widget.refresh()
+        self._refresh_deals_banner()
 
     def _open_cash_drawer(self) -> None:
         log.info("[STUB] cash drawer kick signal")
 
     def _print_receipt(self, txn: Transaction, tid: int) -> None:
-        log.info("[STUB] print receipt: id=%s ref=%s total=%s",
-                 tid, txn.transaction_ref, txn.rounded_total_cents)
+        # PDF fallback always; ESC/POS thermal attempted only when explicitly enabled.
+        try:
+            from core import receipt as _r
+            path = _r.print_receipt(
+                txn,
+                store_name=self.store_name,
+                cashier_name=self.cashier.name,
+                prefer_thermal=False,    # Phase 1: PDF only; flip when printer wired
+            )
+            log.info("receipt for id=%s ref=%s saved to %s",
+                     tid, txn.transaction_ref, path)
+        except Exception:
+            log.exception("receipt generation failed for id=%s ref=%s",
+                          tid, txn.transaction_ref)
 
     def _show_change_dialog(self, ref: str, change_cents: int) -> None:
         dlg = ChangeDialog(ref, change_cents, self)
@@ -984,10 +1005,10 @@ class RegisterScreen(QWidget):
     def _after_card_approved(self, req: PaymentRequest, resp: PaymentResponse) -> None:
         self._dismiss_sheet()
         self._pending_card_req = None
-        # Print Receipt? dialog
+        # Persist transaction FIRST so the receipt can read it back from the DB.
+        self._finalize_card_db(req, resp)
         if self._confirm("Print receipt?"):
             self._print_receipt_card_stub(req, resp)
-        self._finalize_card_db(req, resp)
 
     def _after_card_declined(self, resp: PaymentResponse) -> None:
         self._dismiss_sheet()
@@ -1074,10 +1095,26 @@ class RegisterScreen(QWidget):
         self.cart.clear()
         self._numpad_clear()
         self.cart_widget.refresh()
+        self._refresh_deals_banner()
 
     def _print_receipt_card_stub(self, req: PaymentRequest, resp: PaymentResponse) -> None:
-        log.info("[STUB] print card receipt ref=%s auth=%s last4=%s",
-                 req.transaction_ref, resp.auth_code, resp.card_last4)
+        # Loads the saved card transaction by ref and renders via core.receipt
+        try:
+            saved = db.get_transaction_by_ref(req.transaction_ref)
+            if saved is None:
+                log.error("card receipt: no saved txn for ref=%s", req.transaction_ref)
+                return
+            from core import receipt as _r
+            txn = Transaction.from_db(saved["transaction"], saved["items"])
+            path = _r.print_receipt(
+                txn,
+                store_name=self.store_name,
+                cashier_name=self.cashier.name,
+                prefer_thermal=False,
+            )
+            log.info("card receipt ref=%s saved to %s", req.transaction_ref, path)
+        except Exception:
+            log.exception("card receipt generation failed ref=%s", req.transaction_ref)
 
     def _finalize_card(self, req: PaymentRequest, resp: PaymentResponse) -> None:
         t = self.cart.totals
@@ -1130,11 +1167,13 @@ class RegisterScreen(QWidget):
         self.cart.clear()
         self._numpad_clear()
         self.cart_widget.refresh()
+        self._refresh_deals_banner()
 
     def _on_bag(self) -> None:
         ln = self.cart.add_bag_charge()
         idx = self.cart.lines.index(ln)
         self.cart_widget.refresh(flash_index=idx)
+        self._refresh_deals_banner()
 
     def _on_qty(self) -> None:
         line = self.cart_widget.selected_line()
@@ -1171,6 +1210,7 @@ class RegisterScreen(QWidget):
         idx = self.cart.lines.index(line)
         self.cart.remove_line(idx)
         self.cart_widget.refresh()
+        self._refresh_deals_banner()
 
     def _on_cancel_item(self) -> None:
         self._on_void()   # alias: cancel selected line
@@ -1182,6 +1222,7 @@ class RegisterScreen(QWidget):
             self.cart.clear()
             self.cart_widget.refresh()
             self._numpad_clear()
+            self._refresh_deals_banner()
 
     def _on_lottery_plus(self) -> None:
         cents = self._numpad_cents()
@@ -1192,6 +1233,7 @@ class RegisterScreen(QWidget):
         idx = self.cart.lines.index(ln)
         self.cart_widget.refresh(flash_index=idx)
         self._numpad_clear()
+        self._refresh_deals_banner()
 
     def _on_lottery_minus(self) -> None:
         cents = self._numpad_cents()
@@ -1238,7 +1280,8 @@ class RegisterScreen(QWidget):
         self.cart.clear()
         self.cart_widget.refresh()
         self._refresh_held_count()
-        # No info dialog; the HELD pill above the cart is the visual confirmation
+        self._refresh_deals_banner()
+        # No info dialog; HELD pill above the cart is the visual confirmation
 
     def _on_retrieve(self) -> None:
         # Legacy entry point — Retrieve button removed; HELD pill on cart panel
@@ -1302,6 +1345,61 @@ class PaymentWorker(QObject):
             log.exception("payment worker raised")
             resp = PaymentResponse.error(str(exc))
         self.finished.emit(resp)
+
+
+# ─── Deals banner (top of register, below header) ────────────────────────────
+
+class DealsBanner(QFrame):
+    """Yellow banner showing active deals.
+
+    - Triggered deals (in cart already): green-tinted dot prefix, plain text.
+    - Near-miss deals (hint available): yellow lightbulb prefix + nudge text.
+    - Inactive deals: muted dot.
+
+    `update_deals` is idempotent — call after any cart change.
+    """
+
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.setObjectName("deals_banner")
+        self.setFixedHeight(28)
+        self.setStyleSheet(
+            f"QFrame#deals_banner {{ background-color: {styles.COLORS['warning']};"
+            f" color: {styles.COLORS['text_dark']}; }}"
+        )
+        h = QHBoxLayout(self)
+        h.setContentsMargins(12, 2, 12, 2)
+        h.setSpacing(0)
+        self._label = QLabel("ACTIVE DEALS — (no deals configured)")
+        self._label.setObjectName("deals_banner_label")
+        self._label.setFont(QFont(styles.FONT_FAMILY, 11))
+        self._label.setStyleSheet("background: transparent;")
+        h.addWidget(self._label)
+
+    def update_deals(self, active_deals, hints, triggered_ids) -> None:
+        if not active_deals:
+            self._label.setText("ACTIVE DEALS — (none)")
+            return
+        hint_by_id = {h["deal_id"]: h for h in hints}
+        parts: list[str] = []
+        for d in active_deals:
+            if d.id in triggered_ids:
+                # Already applied to cart
+                parts.append(f"✓ {d.name}")
+            elif d.id in hint_by_id:
+                h = hint_by_id[d.id]
+                if "missing_item_ids" in h:
+                    parts.append(
+                        f"💡 {d.name} — add missing item(s) to save ${h['savings_cents']/100:.2f}"
+                    )
+                else:
+                    needed = h["need_qty"] - h["have_qty"]
+                    parts.append(
+                        f"💡 {d.name} — add {needed} more to save ${h['savings_cents']/100:.2f}"
+                    )
+            else:
+                parts.append(f"• {d.name}")
+        self._label.setText("ACTIVE DEALS:  " + "   |   ".join(parts))
 
 
 # ─── Card payment bottom sheet (slides up from bottom) ───────────────────────
