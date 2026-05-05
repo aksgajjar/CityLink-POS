@@ -716,7 +716,7 @@ class RegisterScreen(QWidget):
             ("Calculator", "ftr_calc",     lambda: self._stub("Calculator")),
             ("Receipts",   "ftr_receipts", lambda: self._stub("Receipts")),
             ("Reprint",    "ftr_reprint",  lambda: self._stub("Reprint")),
-            ("EOD",        "ftr_eod",      lambda: self._stub("EOD")),
+            ("EOD",        "ftr_eod",      self._on_eod),
         ]:
             b = mk_footer(label, name)
             b.clicked.connect(slot)
@@ -1251,6 +1251,76 @@ class RegisterScreen(QWidget):
         self._open_cash_drawer()
         self._info(f"Payout of ${cents/100:.2f} dispensed.")
         self._numpad_clear()
+
+    def _on_eod(self) -> None:
+        """Footer EOD: generate end-of-day PDF + close shift."""
+        if self.shift_id is None:
+            self._error("No active shift — nothing to close.")
+            return
+        if not self.cart.is_empty():
+            if not self._confirm(
+                "Cart has items. Close shift anyway?\n"
+                "(Items will be discarded — hold or finish them first.)"
+            ):
+                return
+        if not self._confirm(
+            "Close shift and print End-of-Day report?"
+        ):
+            return
+
+        # Optional: ask for closing cash count
+        # Simple flow: use numpad value if any, else None (variance shown blank)
+        closing_cash = self._numpad_cents() if self._numpad_cents() > 0 else None
+
+        try:
+            from core import reports as _r
+            data = _r.collect_eod(self.shift_id)
+            store = self.config_store_dict()
+            # Persist closing + close shift BEFORE generating PDF so the report includes
+            # the closing cash count and `closed_at` timestamp.
+            try:
+                if closing_cash is not None:
+                    db.close_shift(self.shift_id, closing_cash)
+                else:
+                    # Close with expected as closing if cashier didn't provide a count
+                    db.close_shift(self.shift_id, data["reconciliation"]["expected_cash_cents"])
+                # Re-collect after close so closed_at + closing_cash appear in PDF
+                data = _r.collect_eod(self.shift_id)
+            except Exception:
+                log.exception("close_shift failed; report will reflect open state")
+
+            pdf = _r.render_eod_pdf(data, store=store)
+            log.info("EOD PDF: %s", pdf)
+            # Open in system viewer (macOS / Linux / Windows best-effort)
+            self._open_file(pdf)
+            self._info(f"EOD report saved.\n{pdf.name}")
+            # Cashier session must lock — shift is closed
+            self.logout_requested.emit()
+        except Exception:
+            log.exception("EOD generation failed")
+            self._error("EOD generation failed. See errors.log.")
+
+    def config_store_dict(self) -> dict:
+        return {
+            "name":     self.store_name,
+            "address":  "",   # filled from main config later
+        }
+
+    def _open_file(self, path) -> None:
+        """Open path in OS default viewer (best-effort, swallow errors)."""
+        try:
+            import sys as _sys
+            import subprocess as _sp
+            p = str(path)
+            if _sys.platform == "darwin":
+                _sp.Popen(["open", p])
+            elif _sys.platform == "win32":
+                import os as _os
+                _os.startfile(p)
+            else:
+                _sp.Popen(["xdg-open", p])
+        except Exception:
+            log.exception("could not open %s in system viewer", path)
 
     def _on_no_sale(self) -> None:
         if not self._confirm("Open drawer (no sale)?"):
