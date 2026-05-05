@@ -284,17 +284,13 @@ class CashManagementScreen(QWidget):
         dlg = TillCountDialog(expected_cents=expected, parent=self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
-        # Till counts are NOT cash_events per spec ("anytime cash count vs expected"
-        # logged separately). For simplicity, log as a 'drop' with note OR add
-        # 'till_count' event_type (would need db schema relaxation).
-        # The spec says "logged" — use a special note prefix for clarity.
+        # Logged as its own event_type='till_count' with the counted amount.
         try:
             db.log_cash_event(
-                shift["id"], "drop", 0,   # zero-amount marker for count event
+                shift["id"], "till_count", dlg.counted_cents,
                 self._admin_name,
                 note=(
-                    f"TILL COUNT  expected={_money(expected)}  "
-                    f"counted={_money(dlg.counted_cents)}  "
+                    f"expected={_money(expected)}  "
                     f"variance={_money(dlg.counted_cents - expected)}"
                 ),
             )

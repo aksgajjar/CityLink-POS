@@ -56,7 +56,7 @@ class AdminReportsScreen(QWidget):
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
         root.setContentsMargins(24, 24, 24, 24)
-        root.setSpacing(12)
+        root.setSpacing(10)
 
         title = QLabel("REPORTS")
         title.setObjectName("admin_reports_title")
@@ -64,6 +64,27 @@ class AdminReportsScreen(QWidget):
         title.setFont(f)
         title.setStyleSheet(f"color: {styles.COLORS['navy']};")
         root.addWidget(title)
+
+        # Quick range buttons
+        quick_row = QHBoxLayout()
+        quick_row.setSpacing(6)
+        quick_row.addWidget(QLabel("Quick range:"))
+        for label, name in [
+            ("Today",       "rep_q_today"),
+            ("Yesterday",   "rep_q_yesterday"),
+            ("This Week",   "rep_q_this_week"),
+            ("This Month",  "rep_q_this_month"),
+            ("Last Month",  "rep_q_last_month"),
+            ("This Year",   "rep_q_this_year"),
+            ("Last Year",   "rep_q_last_year"),
+        ]:
+            b = QPushButton(label)
+            b.setObjectName(name)
+            b.setMinimumHeight(34)
+            b.clicked.connect(lambda _ck=False, n=name: self._set_quick(n))
+            quick_row.addWidget(b)
+        quick_row.addStretch(1)
+        root.addLayout(quick_row)
 
         # Date range row
         date_row = QHBoxLayout()
@@ -82,35 +103,80 @@ class AdminReportsScreen(QWidget):
         self._end.setDisplayFormat("yyyy-MM-dd")
         date_row.addWidget(self._end)
 
-        # Quick range presets
-        for label, days in [("Today", 0), ("7d", 7), ("30d", 30)]:
-            b = QPushButton(label)
-            b.setObjectName(f"rep_preset_{label.lower()}")
-            b.clicked.connect(lambda _ck=False, d=days: self._set_preset(d))
-            date_row.addWidget(b)
-
         date_row.addStretch(1)
         root.addLayout(date_row)
 
-        # Report buttons grid
+        # Comparison-mode toggle
+        comp_row = QHBoxLayout()
+        comp_row.setSpacing(8)
+        self._comp_check = QPushButton("Comparison mode: OFF")
+        self._comp_check.setObjectName("rep_comp_toggle")
+        self._comp_check.setCheckable(True)
+        self._comp_check.toggled.connect(self._on_comp_toggle)
+        comp_row.addWidget(self._comp_check)
+
+        comp_row.addWidget(QLabel("  Period B: "))
+        self._b_start = QDateEdit(QDate.currentDate().addDays(-30))
+        self._b_start.setObjectName("rep_b_start_date")
+        self._b_start.setCalendarPopup(True)
+        self._b_start.setDisplayFormat("yyyy-MM-dd")
+        self._b_start.setEnabled(False)
+        comp_row.addWidget(self._b_start)
+        comp_row.addWidget(QLabel("→"))
+        self._b_end = QDateEdit(QDate.currentDate().addDays(-23))
+        self._b_end.setObjectName("rep_b_end_date")
+        self._b_end.setCalendarPopup(True)
+        self._b_end.setDisplayFormat("yyyy-MM-dd")
+        self._b_end.setEnabled(False)
+        comp_row.addWidget(self._b_end)
+        comp_row.addStretch(1)
+        root.addLayout(comp_row)
+
+        # Sales-report buttons (Visual-Touch style detailed reports)
+        sales_label = QLabel("Detailed Sales Reports")
+        slf = QFont(styles.FONT_FAMILY, 12); slf.setBold(True)
+        sales_label.setFont(slf)
+        sales_label.setStyleSheet(f"color: {styles.COLORS['navy']}; padding-top: 6px;")
+        root.addWidget(sales_label)
+
+        sales_grid = QGridLayout()
+        sales_grid.setSpacing(8)
+        for c in range(5):
+            sales_grid.setColumnStretch(c, 1)
+        for i, (label, name, color_key, slot) in enumerate([
+            ("Daily",      "rep_btn_daily",      "btn_cash",      lambda: self._run_period("Daily")),
+            ("Period",     "rep_btn_period",     "btn_hold",      lambda: self._run_period("Period")),
+            ("Monthly",    "rep_btn_monthly",    "btn_hold",      lambda: self._run_period("Monthly")),
+            ("Yearly",     "rep_btn_yearly",     "btn_hold",      lambda: self._run_period("Yearly")),
+            ("Comparison", "rep_btn_comparison", "btn_lottery_s", self._run_comparison),
+        ]):
+            b = self._mk_btn(label, name, color_key)
+            b.clicked.connect(slot)
+            sales_grid.addWidget(b, 0, i)
+        root.addLayout(sales_grid)
+
+        # Quick reports (existing 5)
+        quick_label = QLabel("Quick Reports")
+        quick_label.setFont(slf)
+        quick_label.setStyleSheet(f"color: {styles.COLORS['navy']}; padding-top: 6px;")
+        root.addWidget(quick_label)
+
         grid = QGridLayout()
-        grid.setSpacing(10)
+        grid.setSpacing(8)
         for c in range(3):
             grid.setColumnStretch(c, 1)
-
         report_buttons = [
-            ("Tax Summary",         "rep_btn_tax",      "btn_card",    self._run_tax_summary),
-            ("Lottery",             "rep_btn_lottery",  "btn_lottery_s", self._run_lottery),
-            ("Best Sellers (Top 20)", "rep_btn_best",   "btn_cash",    self._run_best_sellers),
-            ("Void Log",            "rep_btn_void",     "btn_void",    self._run_void_log),
-            ("Cashier Performance", "rep_btn_cashier",  "btn_hold",    self._run_cashier_perf),
+            ("Tax Summary",         "rep_btn_tax",      "btn_card",       self._run_tax_summary),
+            ("Lottery",             "rep_btn_lottery",  "btn_lottery_s",  self._run_lottery),
+            ("Best Sellers (Top 20)", "rep_btn_best",   "btn_cash",       self._run_best_sellers),
+            ("Void Log",            "rep_btn_void",     "btn_void",       self._run_void_log),
+            ("Cashier Performance", "rep_btn_cashier",  "btn_hold",       self._run_cashier_perf),
         ]
         for i, (label, name, color_key, slot) in enumerate(report_buttons):
             r, c = divmod(i, 3)
             b = self._mk_btn(label, name, color_key)
             b.clicked.connect(slot)
             grid.addWidget(b, r, c)
-
         root.addLayout(grid)
         root.addStretch(1)
 
@@ -143,17 +209,78 @@ class AdminReportsScreen(QWidget):
 
     # ─── Date helpers ────────────────────────────────────────────────────────
 
-    def _set_preset(self, days: int) -> None:
-        end = QDate.currentDate()
-        start = end if days == 0 else end.addDays(-days)
-        self._start.setDate(start)
-        self._end.setDate(end)
+    def _set_quick(self, name: str) -> None:
+        today = QDate.currentDate()
+        if name == "rep_q_today":
+            s = e = today
+        elif name == "rep_q_yesterday":
+            y = today.addDays(-1); s = e = y
+        elif name == "rep_q_this_week":
+            # Monday of this week (ISO)
+            s = today.addDays(-(today.dayOfWeek() - 1))
+            e = today
+        elif name == "rep_q_this_month":
+            s = QDate(today.year(), today.month(), 1)
+            e = today
+        elif name == "rep_q_last_month":
+            first_this = QDate(today.year(), today.month(), 1)
+            last_prev = first_this.addDays(-1)
+            s = QDate(last_prev.year(), last_prev.month(), 1)
+            e = last_prev
+        elif name == "rep_q_this_year":
+            s = QDate(today.year(), 1, 1)
+            e = today
+        elif name == "rep_q_last_year":
+            s = QDate(today.year() - 1, 1, 1)
+            e = QDate(today.year() - 1, 12, 31)
+        else:
+            return
+        self._start.setDate(s); self._end.setDate(e)
+
+    def _on_comp_toggle(self, checked: bool) -> None:
+        self._comp_check.setText(
+            "Comparison mode: ON" if checked else "Comparison mode: OFF"
+        )
+        self._b_start.setEnabled(checked)
+        self._b_end.setEnabled(checked)
 
     def _period(self) -> tuple[str, str]:
         return (self._start.date().toString("yyyy-MM-dd"),
                 self._end.date().toString("yyyy-MM-dd"))
 
+    def _period_b(self) -> tuple[str, str]:
+        return (self._b_start.date().toString("yyyy-MM-dd"),
+                self._b_end.date().toString("yyyy-MM-dd"))
+
     # ─── Report runners ──────────────────────────────────────────────────────
+
+    def _run_period(self, report_type: str) -> None:
+        s, e = self._period()
+        try:
+            data = reports.collect_period_report(s, e)
+            pdf = reports.render_period_report_pdf(
+                data, store=self.store, report_type=report_type,
+            )
+            self._info(f"{report_type} report saved.\n{pdf.name}")
+            self._open_file(pdf)
+        except Exception:
+            log.exception("period report '%s' failed", report_type)
+            self._error(f"Failed to render {report_type} report.")
+
+    def _run_comparison(self) -> None:
+        if not self._comp_check.isChecked():
+            self._info("Enable Comparison mode and pick Period B first.")
+            return
+        a_s, a_e = self._period()
+        b_s, b_e = self._period_b()
+        try:
+            cmp_data = reports.collect_comparison_report(a_s, a_e, b_s, b_e)
+            pdf = reports.render_comparison_pdf(cmp_data, store=self.store)
+            self._info(f"Comparison report saved.\n{pdf.name}")
+            self._open_file(pdf)
+        except Exception:
+            log.exception("comparison report failed")
+            self._error("Failed to render comparison report.")
 
     def _run_tax_summary(self) -> None:
         s, e = self._period()
