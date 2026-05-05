@@ -762,7 +762,6 @@ class RegisterScreen(QWidget):
 
     def _handle_barcode(self, barcode: str) -> None:
         log.info("scan: %s", barcode)
-        # Briefly show scanned barcode in search bar (cleared on next scan/keypress)
         if hasattr(self, "_search_input") and self._search_input is not None:
             self._search_input.setText(barcode)
             QTimer.singleShot(1500, lambda: self._search_input.clear()
@@ -773,8 +772,9 @@ class RegisterScreen(QWidget):
             self._info(f"Unknown barcode: {barcode}\nAdmin → Inventory to add it.")
             return
         from core.models import Item
-        self.cart.add_item(Item.from_row(row))
-        self.cart_widget.refresh()
+        ln = self.cart.add_item(Item.from_row(row))
+        idx = self.cart.lines.index(ln)
+        self.cart_widget.refresh(flash_index=idx)
 
     # ─── department / manual entry ───────────────────────────────────────────
 
@@ -790,8 +790,9 @@ class RegisterScreen(QWidget):
         if d is None:
             self._error(f"Unknown department: {dept_id}")
             return
-        self.cart.add_manual(name=d["label"], unit_price_cents=cents, department=dept_id, quantity=1)
-        self.cart_widget.refresh()
+        ln = self.cart.add_manual(name=d["label"], unit_price_cents=cents, department=dept_id, quantity=1)
+        idx = self.cart.lines.index(ln)
+        self.cart_widget.refresh(flash_index=idx)
         self._numpad_clear()
 
     # ─── action handlers ─────────────────────────────────────────────────────
@@ -1002,8 +1003,9 @@ class RegisterScreen(QWidget):
         self.cart_widget.refresh()
 
     def _on_bag(self) -> None:
-        self.cart.add_bag_charge()
-        self.cart_widget.refresh()
+        ln = self.cart.add_bag_charge()
+        idx = self.cart.lines.index(ln)
+        self.cart_widget.refresh(flash_index=idx)
 
     def _on_qty(self) -> None:
         line = self.cart_widget.selected_line()
@@ -1057,8 +1059,9 @@ class RegisterScreen(QWidget):
         if cents <= 0:
             self._info("Enter lottery amount on numpad first.")
             return
-        self.cart.add_lottery_sale(cents)
-        self.cart_widget.refresh()
+        ln = self.cart.add_lottery_sale(cents)
+        idx = self.cart.lines.index(ln)
+        self.cart_widget.refresh(flash_index=idx)
         self._numpad_clear()
 
     def _on_lottery_minus(self) -> None:

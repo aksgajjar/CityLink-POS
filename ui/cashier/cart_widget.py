@@ -1,25 +1,26 @@
-"""Cart display + qty controls + totals panel.
+"""Cart display + per-row inline controls + totals panel.
 
 Wraps a live `Cart` object — does not copy. Mutations call back into the cart
 (which calls `recompute()` internally) and then `refresh()` rebuilds the view.
 
-Row visuals:
-  - regular item:  default white background
-  - deal applied:  deal_highlight (yellow)
-  - lottery line:  light purple tint
-  - bag charge:    muted italic, very light grey
+Layout:
+  ┌── Big TOTAL header (white bg, 24pt navy amount) ──┐
+  ├── Cart list (#EEF2FF bg, per-row tint by kind) ───┤
+  │   selected row shows inline [−][N][+][🗑] controls│
+  ├── Totals breakdown panel (Subtotal, GST, PST, …) ─┤
+  └────────────────────────────────────────────────────┘
 
 Signals:
-  - item_selected(object)  : CartItem or None
-  - qty_changed(int)        : new quantity after +/- press
-  - item_removed()          : after Remove press
+  item_selected(object)  : CartItem or None
+  qty_changed(int)        : new qty after row +/- press
+  item_removed()          : after row 🗑 press
 """
 
 from __future__ import annotations
 
 from typing import Optional
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QFrame,
@@ -41,85 +42,204 @@ from ui import styles
 
 log = get_logger("ui.cart")
 
-LOTTERY_TINT = "#F4ECF7"   # light purple
-BAG_TINT = "#FAFAFA"       # near-white grey
+CART_BG = "#EEF2FF"           # very light blue-grey, premium feel
+ROW_BG_DEFAULT = "#EEF2FF"
+ROW_BG_DEAL = styles.COLORS["deal_highlight"]   # yellow
+ROW_BG_LOTTERY = "#F4ECF7"     # light purple
+ROW_BG_BAG = "#FAFAFA"         # near-white grey
+ROW_BG_FLASH = "#D5F5E3"       # bright mint, fades after 800ms
+FLASH_MS = 800
 
 
-# ─── Row widget ──────────────────────────────────────────────────────────────
+# ─── Big TOTAL header ────────────────────────────────────────────────────────
+
+class CartTotalHeader(QWidget):
+    """Prominent TOTAL bar above the cart list."""
+
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.setObjectName("cart_total_header")
+        self.setFixedHeight(64)
+        self.setStyleSheet(
+            f"QWidget#cart_total_header {{ background-color: white;"
+            f" border-bottom: 2px solid {styles.COLORS['navy']}; }}"
+        )
+        h = QHBoxLayout(self)
+        h.setContentsMargins(14, 6, 14, 6)
+        h.setSpacing(10)
+
+        lbl = QLabel("TOTAL")
+        lbl.setObjectName("cart_total_label")
+        lf = QFont(styles.FONT_FAMILY, 16); lf.setBold(True)
+        lbl.setFont(lf)
+        lbl.setStyleSheet(f"color: {styles.COLORS['navy']}; background: transparent;")
+        h.addWidget(lbl)
+
+        self.amount = QLabel("$0.00")
+        self.amount.setObjectName("cart_total_amount")
+        self.amount.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        af = QFont(styles.FONT_FAMILY, 24); af.setBold(True)
+        self.amount.setFont(af)
+        self.amount.setStyleSheet(f"color: {styles.COLORS['navy']}; background: transparent;")
+        h.addWidget(self.amount, stretch=1)
+
+    def update_amount(self, total_cents: int) -> None:
+        self.amount.setText(f"${total_cents / 100:.2f}")
+
+
+# ─── Per-row widget ──────────────────────────────────────────────────────────
 
 class CartRow(QWidget):
-    """Visual row for one CartItem. Used via QListWidget.setItemWidget."""
+    """One cart line. Selected → static qty/unit/total swapped for inline controls."""
+
+    qty_minus = pyqtSignal(int)   # line_index
+    qty_plus = pyqtSignal(int)
+    remove_clicked = pyqtSignal(int)
 
     def __init__(self, line: CartItem, line_index: int, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self.line_index = line_index
         self.line = line
         self.setObjectName(f"cart_row_{line_index}")
+        self._selected: bool = False
         self._build(line)
+        self._apply_tint(line)
 
     def _build(self, line: CartItem) -> None:
         h = QHBoxLayout(self)
-        h.setContentsMargins(8, 6, 8, 6)
+        h.setContentsMargins(10, 6, 10, 6)
         h.setSpacing(8)
 
-        # Name (stretches)
-        name = QLabel(line.name)
-        name.setObjectName("cart_row_name")
-        name.setFont(QFont(styles.FONT_FAMILY, 13))
-        h.addWidget(name, stretch=1)
+        # Name (always visible, stretches)
+        self._name_lbl = QLabel(line.name)
+        self._name_lbl.setObjectName("cart_row_name")
+        self._name_lbl.setFont(QFont(styles.FONT_FAMILY, 13))
+        h.addWidget(self._name_lbl, stretch=1)
 
-        # Qty
-        qty = QLabel(f"{line.quantity}x")
-        qty.setObjectName("cart_row_qty")
-        qty.setMinimumWidth(40)
-        qty.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        h.addWidget(qty)
+        # Static cluster: qty + unit + (discount) + total
+        self._static = QWidget()
+        self._static.setObjectName("cart_row_static")
+        sh = QHBoxLayout(self._static)
+        sh.setContentsMargins(0, 0, 0, 0); sh.setSpacing(8)
 
-        # Unit price
-        unit = QLabel(f"${line.unit_price_cents / 100:.2f}")
-        unit.setObjectName("cart_row_unit")
-        unit.setMinimumWidth(70)
-        unit.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        unit.setStyleSheet(f"color: {styles.COLORS['text_muted']};")
-        h.addWidget(unit)
+        self._qty_lbl = QLabel(f"{line.quantity}x")
+        self._qty_lbl.setObjectName("cart_row_qty")
+        self._qty_lbl.setMinimumWidth(36)
+        self._qty_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        sh.addWidget(self._qty_lbl)
 
-        # Discount (only when present)
+        self._unit_lbl = QLabel(f"${line.unit_price_cents / 100:.2f}")
+        self._unit_lbl.setObjectName("cart_row_unit")
+        self._unit_lbl.setMinimumWidth(64)
+        self._unit_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self._unit_lbl.setStyleSheet(f"color: {styles.COLORS['text_muted']}; background: transparent;")
+        sh.addWidget(self._unit_lbl)
+
         if line.deal_discount_cents > 0:
             disc = QLabel(f"-${line.deal_discount_cents / 100:.2f}")
             disc.setObjectName("cart_row_discount")
-            disc.setMinimumWidth(80)
+            disc.setMinimumWidth(72)
             disc.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            disc.setStyleSheet(f"color: {styles.COLORS['btn_cash']}; font-weight: bold;")
-            h.addWidget(disc)
+            disc.setStyleSheet(f"color: {styles.COLORS['btn_cash']}; font-weight: bold; background: transparent;")
+            sh.addWidget(disc)
 
-        # Line total (bold)
-        total = QLabel(f"${line.line_total_cents / 100:.2f}")
-        total.setObjectName("cart_row_total")
-        total.setMinimumWidth(80)
-        total.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        f = QFont(styles.FONT_FAMILY, 13)
-        f.setBold(True)
-        total.setFont(f)
-        h.addWidget(total)
+        self._total_lbl = QLabel(f"${line.line_total_cents / 100:.2f}")
+        self._total_lbl.setObjectName("cart_row_total")
+        self._total_lbl.setMinimumWidth(80)
+        self._total_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        tf = QFont(styles.FONT_FAMILY, 13); tf.setBold(True)
+        self._total_lbl.setFont(tf)
+        sh.addWidget(self._total_lbl)
 
-        self._apply_tint(line)
+        h.addWidget(self._static)
+
+        # Inline controls (hidden until row selected)
+        self._controls = QWidget()
+        self._controls.setObjectName("cart_row_controls")
+        ch = QHBoxLayout(self._controls)
+        ch.setContentsMargins(0, 0, 0, 0); ch.setSpacing(4)
+
+        self._btn_minus = self._mk_ctrl("−", f"row{self.line_index}_btn_minus", color=styles.COLORS["blue_mid"])
+        self._btn_minus.clicked.connect(lambda _ck=False: self.qty_minus.emit(self.line_index))
+        ch.addWidget(self._btn_minus)
+
+        self._qty_in_ctrl = QLabel(str(line.quantity))
+        self._qty_in_ctrl.setObjectName(f"row{self.line_index}_qty_inline")
+        self._qty_in_ctrl.setMinimumWidth(40)
+        self._qty_in_ctrl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        cf = QFont(styles.FONT_FAMILY, 14); cf.setBold(True)
+        self._qty_in_ctrl.setFont(cf)
+        self._qty_in_ctrl.setStyleSheet("background: transparent;")
+        ch.addWidget(self._qty_in_ctrl)
+
+        self._btn_plus = self._mk_ctrl("+", f"row{self.line_index}_btn_plus", color=styles.COLORS["blue_mid"])
+        self._btn_plus.clicked.connect(lambda _ck=False: self.qty_plus.emit(self.line_index))
+        ch.addWidget(self._btn_plus)
+
+        self._btn_remove = self._mk_ctrl("🗑", f"row{self.line_index}_btn_remove", color=styles.COLORS["btn_cancel"])
+        self._btn_remove.clicked.connect(lambda _ck=False: self.remove_clicked.emit(self.line_index))
+        ch.addWidget(self._btn_remove)
+
+        self._controls.hide()
+        h.addWidget(self._controls)
+
+    def _mk_ctrl(self, text: str, name: str, *, color: str) -> QPushButton:
+        b = QPushButton(text)
+        b.setObjectName(name)
+        b.setMinimumSize(36, 36)
+        b.setMaximumHeight(36)
+        f = QFont(styles.FONT_FAMILY, 14); f.setBold(True)
+        b.setFont(f)
+        b.setStyleSheet(
+            f"QPushButton {{ background-color: {color}; color: white;"
+            f" border: none; border-radius: 4px; padding: 2px 10px; }}"
+            f"QPushButton:pressed {{ padding: 4px 10px 0px 12px; }}"
+        )
+        return b
 
     def _apply_tint(self, line: CartItem) -> None:
+        if self._selected:
+            return
         if line.kind == "lottery":
-            self.setStyleSheet(f"background-color: {LOTTERY_TINT};")
+            bg = ROW_BG_LOTTERY
+            extra = ""
         elif line.kind == "bag":
-            self.setStyleSheet(
-                f"background-color: {BAG_TINT}; "
-                f"color: {styles.COLORS['text_muted']}; "
-                f"font-style: italic;"
-            )
+            bg = ROW_BG_BAG
+            extra = f"color: {styles.COLORS['text_muted']}; font-style: italic;"
         elif line.deal_id is not None:
-            self.setStyleSheet(f"background-color: {styles.COLORS['deal_highlight']};")
+            bg = ROW_BG_DEAL
+            extra = ""
         else:
-            self.setStyleSheet(f"background-color: {styles.COLORS['white']};")
+            bg = ROW_BG_DEFAULT
+            extra = ""
+        self.setStyleSheet(f"CartRow {{ background-color: {bg}; }} {extra}")
+
+    # ─── Public API for CartWidget ───────────────────────────────────────────
+
+    def set_selected(self, selected: bool) -> None:
+        """Toggle inline controls. Static cluster hides while selected."""
+        self._selected = selected
+        if selected:
+            self._static.hide()
+            self._qty_in_ctrl.setText(str(self.line.quantity))
+            self._controls.show()
+            # Slightly tinted bg for selected
+            self.setStyleSheet(
+                f"CartRow {{ background-color: {styles.COLORS['blue_light']}; }}"
+                f" QLabel {{ color: white; background: transparent; }}"
+            )
+        else:
+            self._controls.hide()
+            self._static.show()
+            self._apply_tint(self.line)
+
+    def flash_added(self) -> None:
+        """Flash green bg for FLASH_MS then revert to natural tint."""
+        self.setStyleSheet(f"CartRow {{ background-color: {ROW_BG_FLASH}; }}")
+        QTimer.singleShot(FLASH_MS, lambda: self._apply_tint(self.line) if not self._selected else None)
 
 
-# ─── Totals panel ────────────────────────────────────────────────────────────
+# ─── Totals breakdown panel ──────────────────────────────────────────────────
 
 class TotalsPanel(QWidget):
     """Subtotal/Discount/GST/PST/Deposit/Bag/TOTAL/(Cash rounded)."""
@@ -137,22 +257,15 @@ class TotalsPanel(QWidget):
 
     def _build(self) -> None:
         grid = QGridLayout(self)
-        grid.setContentsMargins(12, 10, 12, 10)
+        grid.setContentsMargins(12, 8, 12, 8)
         grid.setHorizontalSpacing(20)
-        grid.setVerticalSpacing(4)
+        grid.setVerticalSpacing(2)
 
-        font_row = QFont(styles.FONT_FAMILY, 12)
-        font_total_label = QFont(styles.FONT_FAMILY, 18)
-        font_total_label.setBold(True)
-        font_total_value = QFont(styles.FONT_FAMILY, 28)
-        font_total_value.setBold(True)
+        font_row = QFont(styles.FONT_FAMILY, 11)
 
         def add_row(row: int, label_text: str, value_name: str) -> QLabel:
-            lab = QLabel(label_text)
-            lab.setFont(font_row)
-            val = QLabel("$0.00")
-            val.setObjectName(value_name)
-            val.setFont(font_row)
+            lab = QLabel(label_text); lab.setFont(font_row)
+            val = QLabel("$0.00"); val.setObjectName(value_name); val.setFont(font_row)
             val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             grid.addWidget(lab, row, 0)
             grid.addWidget(val, row, 1)
@@ -165,44 +278,23 @@ class TotalsPanel(QWidget):
         self._lbl_deposit  = add_row(4, "Deposit:",  "totals_deposit")
         self._lbl_bag      = add_row(5, "Bag:",      "totals_bag")
 
-        # Separator
-        sep = QFrame()
-        sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setStyleSheet(f"color: {styles.COLORS['blue_mid']};")
-        grid.addWidget(sep, 6, 0, 1, 2)
-
-        # TOTAL line
-        total_label = QLabel("TOTAL:")
-        total_label.setObjectName("total_label")
-        total_label.setFont(font_total_label)
-        self._lbl_total = QLabel("$0.00")
-        self._lbl_total.setObjectName("total_amount")
-        self._lbl_total.setFont(font_total_value)
-        self._lbl_total.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self._lbl_total.setStyleSheet(f"color: {styles.COLORS['navy']};")
-        grid.addWidget(total_label, 7, 0)
-        grid.addWidget(self._lbl_total, 7, 1)
-
         # Cash rounded preview (hidden when equal to total)
         self._lbl_cash_preview = QLabel("")
         self._lbl_cash_preview.setObjectName("totals_cash_preview")
-        self._lbl_cash_preview.setFont(QFont(styles.FONT_FAMILY, 11))
+        self._lbl_cash_preview.setFont(QFont(styles.FONT_FAMILY, 10))
         self._lbl_cash_preview.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self._lbl_cash_preview.setStyleSheet(f"color: {styles.COLORS['text_muted']};")
-        grid.addWidget(self._lbl_cash_preview, 8, 0, 1, 2)
+        grid.addWidget(self._lbl_cash_preview, 6, 0, 1, 2)
 
     def update_totals(self, totals: dict) -> None:
         def fmt(c: int) -> str: return f"${c / 100:.2f}"
-
         self._lbl_subtotal.setText(fmt(totals["subtotal_cents"]))
-        # Discount shown as negative when present
         d = totals["discount_cents"]
         self._lbl_discount.setText(f"-{fmt(d)}" if d else "$0.00")
         self._lbl_gst.setText(fmt(totals["gst_cents"]))
         self._lbl_pst.setText(fmt(totals["pst_cents"]))
         self._lbl_deposit.setText(fmt(totals["deposit_cents"]))
         self._lbl_bag.setText(fmt(totals["bag_charge_cents"]))
-        self._lbl_total.setText(fmt(totals["total_cents"]))
         if totals["rounded_total_cents"] != totals["total_cents"]:
             self._lbl_cash_preview.setText(
                 f"(Cash → {fmt(totals['rounded_total_cents'])})"
@@ -216,11 +308,11 @@ class TotalsPanel(QWidget):
 # ─── Main widget ─────────────────────────────────────────────────────────────
 
 class CartWidget(QWidget):
-    """Live cart view + qty controls + totals."""
+    """Live cart view with inline row controls + big TOTAL header."""
 
     item_selected = pyqtSignal(object)   # CartItem | None
-    qty_changed   = pyqtSignal(int)      # new quantity
-    item_removed  = pyqtSignal()
+    qty_changed = pyqtSignal(int)        # new qty
+    item_removed = pyqtSignal()
 
     def __init__(self, cart: Cart, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -230,71 +322,39 @@ class CartWidget(QWidget):
         self._build_ui()
         self.refresh()
 
-    # ─── construction ───────────────────────────────────────────────────────
-
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
-        root.setContentsMargins(6, 6, 6, 6)
-        root.setSpacing(6)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        # Big TOTAL header
+        self.total_header = CartTotalHeader()
+        root.addWidget(self.total_header)
 
         # Cart list
         self._list = QListWidget()
         self._list.setObjectName("cart")
         self._list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
         self._list.itemSelectionChanged.connect(self._on_selection_changed)
+        self._list.setStyleSheet(
+            f"QListWidget#cart {{ background-color: {CART_BG};"
+            f" border: 1px solid #C8D0E0; }}"
+            f"QListWidget#cart::item {{ border: none; padding: 0; }}"
+            f"QListWidget#cart::item:selected {{ background: transparent; }}"
+        )
         root.addWidget(self._list, stretch=1)
 
-        # Qty + Remove control row (enabled only when row selected)
-        ctrl = QHBoxLayout()
-        ctrl.setSpacing(8)
-        self._btn_minus = self._mk_ctrl("−", "cart_btn_minus")
-        self._btn_minus.clicked.connect(lambda: self._adjust_qty(-1))
-        ctrl.addWidget(self._btn_minus)
-
-        self._qty_label = QLabel("—")
-        self._qty_label.setObjectName("cart_btn_qty_label")
-        self._qty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        f = QFont(styles.FONT_FAMILY, 16)
-        f.setBold(True)
-        self._qty_label.setFont(f)
-        self._qty_label.setMinimumWidth(60)
-        ctrl.addWidget(self._qty_label)
-
-        self._btn_plus = self._mk_ctrl("+", "cart_btn_plus")
-        self._btn_plus.clicked.connect(lambda: self._adjust_qty(+1))
-        ctrl.addWidget(self._btn_plus)
-
-        ctrl.addStretch(1)
-
-        self._btn_remove = self._mk_ctrl("Remove", "cart_btn_remove")
-        self._btn_remove.setStyleSheet(
-            f"QPushButton {{ background-color: {styles.COLORS['btn_cancel']}; "
-            f"color: white; border: none; border-radius: 6px; padding: 6px 16px; }}"
-        )
-        self._btn_remove.clicked.connect(self._remove_selected)
-        ctrl.addWidget(self._btn_remove)
-
-        root.addLayout(ctrl)
-
-        # Totals panel
+        # Totals breakdown panel
         self.totals_panel = TotalsPanel()
+        self.totals_panel.setStyleSheet(
+            "QWidget#totals_panel { background-color: white; border-top: 1px solid #C8D0E0; }"
+        )
         root.addWidget(self.totals_panel)
 
-        self._set_controls_enabled(False)
+    # ─── Refresh / sync ──────────────────────────────────────────────────────
 
-    def _mk_ctrl(self, text: str, name: str) -> QPushButton:
-        b = QPushButton(text)
-        b.setObjectName(name)
-        b.setMinimumSize(50, 36)
-        f = QFont(styles.FONT_FAMILY, 16)
-        f.setBold(True)
-        b.setFont(f)
-        return b
-
-    # ─── refresh / sync from cart ───────────────────────────────────────────
-
-    def refresh(self) -> None:
-        """Rebuild the list view and totals from the current Cart state."""
+    def refresh(self, *, flash_index: Optional[int] = None) -> None:
+        """Rebuild list + totals. If flash_index is set, that row flashes green."""
         prev_selected = self._selected_index
         self._list.blockSignals(True)
         self._list.clear()
@@ -302,79 +362,94 @@ class CartWidget(QWidget):
         for idx, line in enumerate(self.cart.lines):
             item = QListWidgetItem(self._list)
             row = CartRow(line, idx)
+            row.qty_minus.connect(self._on_row_minus)
+            row.qty_plus.connect(self._on_row_plus)
+            row.remove_clicked.connect(self._on_row_remove)
             row.adjustSize()
             hint = row.sizeHint()
-            from PyQt6.QtCore import QSize
-            item.setSizeHint(QSize(hint.width(), max(hint.height(), 44)))
+            item.setSizeHint(QSize(hint.width(), max(hint.height(), 50)))
             self._list.addItem(item)
             self._list.setItemWidget(item, row)
             item.setData(Qt.ItemDataRole.UserRole, idx)
 
-        # Restore selection if still valid
         if prev_selected is not None and prev_selected < len(self.cart.lines):
             self._list.setCurrentRow(prev_selected)
+            row_w = self._row_widget(prev_selected)
+            if row_w is not None:
+                row_w.set_selected(True)
         else:
             self._selected_index = None
 
         self._list.blockSignals(False)
-        self.totals_panel.update_totals(self.cart.totals)
-        self._sync_controls()
 
-    # ─── selection / qty / remove handlers ──────────────────────────────────
+        # Totals
+        self.totals_panel.update_totals(self.cart.totals)
+        self.total_header.update_amount(self.cart.totals["total_cents"])
+
+        # Flash newly added row
+        if flash_index is not None and 0 <= flash_index < len(self.cart.lines):
+            row_w = self._row_widget(flash_index)
+            if row_w is not None:
+                row_w.flash_added()
+
+    def _row_widget(self, idx: int) -> Optional[CartRow]:
+        item = self._list.item(idx)
+        if item is None:
+            return None
+        return self._list.itemWidget(item)   # type: ignore[return-value]
+
+    # ─── Selection ───────────────────────────────────────────────────────────
 
     def _on_selection_changed(self) -> None:
+        # Deselect previous row's inline controls
+        if self._selected_index is not None:
+            prev = self._row_widget(self._selected_index)
+            if prev is not None:
+                prev.set_selected(False)
+
         items = self._list.selectedItems()
         if not items:
             self._selected_index = None
-            self._sync_controls()
             self.item_selected.emit(None)
             return
         idx = items[0].data(Qt.ItemDataRole.UserRole)
         self._selected_index = idx
-        line = self.cart.lines[idx]
-        self._sync_controls()
-        self.item_selected.emit(line)
+        new_row = self._row_widget(idx)
+        if new_row is not None:
+            new_row.set_selected(True)
+        self.item_selected.emit(self.cart.lines[idx])
 
-    def _adjust_qty(self, delta: int) -> None:
-        if self._selected_index is None:
+    # ─── Per-row actions ─────────────────────────────────────────────────────
+
+    def _on_row_minus(self, idx: int) -> None:
+        if idx >= len(self.cart.lines):
             return
-        idx = self._selected_index
         line = self.cart.lines[idx]
-        new_qty = line.quantity + delta
-        if new_qty <= 0:
-            # Treat as remove
-            self._remove_selected()
+        if line.quantity <= 1:
+            self._on_row_remove(idx)
             return
-        self.cart.set_quantity(idx, new_qty)
+        self.cart.set_quantity(idx, line.quantity - 1)
         self.refresh()
-        self.qty_changed.emit(new_qty)
+        self.qty_changed.emit(line.quantity)
 
-    def _remove_selected(self) -> None:
-        if self._selected_index is None:
+    def _on_row_plus(self, idx: int) -> None:
+        if idx >= len(self.cart.lines):
             return
-        idx = self._selected_index
+        line = self.cart.lines[idx]
+        new_q = line.quantity + 1
+        self.cart.set_quantity(idx, new_q)
+        self.refresh()
+        self.qty_changed.emit(new_q)
+
+    def _on_row_remove(self, idx: int) -> None:
+        if idx >= len(self.cart.lines):
+            return
         self.cart.remove_line(idx)
         self._selected_index = None
         self.refresh()
         self.item_removed.emit()
 
-    # ─── helpers ────────────────────────────────────────────────────────────
-
-    def _sync_controls(self) -> None:
-        if self._selected_index is None or self._selected_index >= len(self.cart.lines):
-            self._set_controls_enabled(False)
-            self._qty_label.setText("—")
-            return
-        line = self.cart.lines[self._selected_index]
-        self._set_controls_enabled(True)
-        self._qty_label.setText(str(line.quantity))
-
-    def _set_controls_enabled(self, enabled: bool) -> None:
-        self._btn_minus.setEnabled(enabled)
-        self._btn_plus.setEnabled(enabled)
-        self._btn_remove.setEnabled(enabled)
-
-    # ─── public ─────────────────────────────────────────────────────────────
+    # ─── Public helpers ──────────────────────────────────────────────────────
 
     def selected_line(self) -> Optional[CartItem]:
         if self._selected_index is None or self._selected_index >= len(self.cart.lines):
@@ -384,4 +459,3 @@ class CartWidget(QWidget):
     def clear_selection(self) -> None:
         self._list.clearSelection()
         self._selected_index = None
-        self._sync_controls()
