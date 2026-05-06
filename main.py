@@ -313,6 +313,12 @@ class MainWindow(QMainWindow):
             terminal=self.terminal,
             sound_player=self.sound_player,
         )
+        # Inject configurable lottery-payout admin-PIN threshold (cents).
+        # Default $20 if config doesn't override.
+        feat = self.config.get("features", {}) or {}
+        self._register._payout_admin_threshold = int(
+            feat.get("lottery_payout_admin_pin_threshold_cents", 2000)
+        )
         self._register.logout_requested.connect(self._on_logout)
         self._register.admin_requested.connect(self._on_admin_requested)
         self.stack.addWidget(self._register)

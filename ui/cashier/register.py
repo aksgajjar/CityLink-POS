@@ -112,6 +112,10 @@ class RegisterScreen(QWidget):
         # Guards against double-tap on Cash/Card while a sale is being saved
         # to DB or routed to the card worker. Cleared after finalize / error.
         self._payment_locked: bool = False
+        # Lottery payout admin-PIN threshold (cents). Loaded from config.json
+        # at app startup; falls back to $20 if missing. Set by main on
+        # construction via attribute injection.
+        self._payout_admin_threshold: int = 2000
 
         # Card payment state (QThread + worker held during a transaction)
         self._payment_thread: Optional[QThread] = None
@@ -1288,6 +1292,15 @@ class RegisterScreen(QWidget):
         # (rounded == 0). Skip tender/partial/paid-in-full logic.
         if rounded <= 0:
             cash_back = max(0, -rounded) + max(0, partial)
+            # Roadmap A1: payouts above the configured threshold require
+            # admin PIN re-auth. Skim prevention. Threshold lives in
+            # config.json -> features.lottery_payout_admin_pin_threshold_cents
+            # (default $20). Pure-payout carts only — mixed sales not gated.
+            if (cash_back >= self._payout_admin_threshold
+                    and self._is_payout_only_cart()
+                    and not self._require_admin_pin()):
+                # Admin denied / cancelled → bail out without tearing cart down.
+                return
             self._payment_locked = True
             try:
                 self._finalize_cash_back(prior_partial_cents=partial,
@@ -1961,15 +1974,35 @@ class RegisterScreen(QWidget):
         self._on_void()   # alias: cancel selected line
 
     def _on_clear_cart(self) -> None:
-        if self.cart.is_empty():
+        if self.cart.is_empty() and self._cash_partial_cents == 0:
             return
-        if self._confirm("Clear the entire cart?"):
-            self.cart.clear()
-            self._cash_partial_cents = 0
-            self._last_dept_add = None
-            self.cart_widget.refresh()
-            self._numpad_clear()
-            self._refresh_deals_banner()
+        # Roadmap R2: extra-strong confirm if partial cash already collected.
+        # Clearing the cart at that point throws away money the cashier has
+        # in their hand — must not be a single-tap action.
+        if self._cash_partial_cents > 0:
+            partial_str = f"${self._cash_partial_cents/100:.2f}"
+            msg = (
+                f"⚠ Partial cash of {partial_str} has already been collected.\n\n"
+                f"Cancelling now will discard the cart AND lose track of the "
+                f"{partial_str} cash already taken from the customer.\n\n"
+                f"Are you sure you want to cancel?"
+            )
+            if not self._confirm(msg):
+                return
+        else:
+            if not self._confirm("Clear the entire cart?"):
+                return
+        self.cart.clear()
+        self._cash_partial_cents = 0
+        try:
+            self.cart_widget.totals_panel.set_partial_paid(0)
+        except Exception:
+            pass
+        self._last_dept_add = None
+        self.cart_widget.refresh()
+        self._numpad_clear()
+        self._refresh_deals_banner()
+        self._focus_search()
 
     def _on_lottery_plus(self) -> None:
         cents = self._numpad_cents()
