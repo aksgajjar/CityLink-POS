@@ -190,21 +190,19 @@ class LoginScreen(QWidget):
     def _build_logo_label(self) -> QLabel:
         """Load assets/logo.png. Fall back to text 'CITYLINK' if missing.
 
-        Resolves path relative to the project root (so the asset loads even
-        when the app is launched from a different cwd). Adds a subtle drop
-        shadow for depth on the light background.
+        Path resolved relative to this module's project root so it loads
+        regardless of cwd. No translucent attribute, no fixed-size clip,
+        no graphics effect — those interact badly with QLabel pixmaps and
+        were hiding the logo entirely.
         """
         logo = QLabel()
         logo.setObjectName("logo_text")
         logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        logo.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         logo.setStyleSheet("background: transparent;")
 
-        # Resolve logo path relative to this module's project root so the
-        # asset loads regardless of the launch cwd.
         candidate_paths = [
-            LOGO_PATH,
             Path(__file__).resolve().parent.parent / "assets" / "logo.png",
+            LOGO_PATH,
         ]
         pixmap: QPixmap | None = None
         used_path: Path | None = None
@@ -224,7 +222,6 @@ class LoginScreen(QWidget):
 
         if pixmap is not None:
             logo.setPixmap(pixmap)
-            logo.setFixedSize(pixmap.size())
             log.info("login logo loaded from %s (%dx%d)",
                      used_path, pixmap.width(), pixmap.height())
         else:
@@ -236,18 +233,6 @@ class LoginScreen(QWidget):
                 f"color: {styles.COLORS['navy']}; background: transparent;"
                 f" letter-spacing: 4px;"
             )
-
-        # Subtle depth shadow.
-        try:
-            from PyQt6.QtWidgets import QGraphicsDropShadowEffect
-            from PyQt6.QtGui import QColor as _QC
-            sh = QGraphicsDropShadowEffect(logo)
-            sh.setBlurRadius(24)
-            sh.setOffset(0, 4)
-            sh.setColor(_QC(0, 0, 0, 60))
-            logo.setGraphicsEffect(sh)
-        except Exception:
-            pass
         return logo
 
     def _build_pin_display(self) -> QWidget:
@@ -277,9 +262,11 @@ class LoginScreen(QWidget):
     def _build_numpad(self) -> QWidget:
         self.numpad_frame = QFrame()
         self.numpad_frame.setObjectName("numpad_frame")
+        self.numpad_frame.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         grid = QGridLayout(self.numpad_frame)
         grid.setSpacing(12)
         grid.setContentsMargins(0, 0, 0, 0)
+        grid.setSizeConstraint(grid.SizeConstraint.SetFixedSize)
 
         digit_positions = [
             ("1", 0, 0), ("2", 0, 1), ("3", 0, 2),
@@ -313,6 +300,10 @@ class LoginScreen(QWidget):
         b = QPushButton(text)
         b.setObjectName(name)
         b.setProperty("loginKey", role)
+        # Lock to fixed size so layout vertical stretching doesn't make
+        # buttons grow into each other.
+        b.setFixedSize(96, 88)
+        b.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         return b
 
     def _build_status(self) -> QWidget:
