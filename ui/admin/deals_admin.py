@@ -872,6 +872,20 @@ class DealEditDialog(QDialog):
         wv.setContentsMargins(0, 0, 0, 0)
         wv.setSpacing(8)
 
+        # Helpful banner so cashier knows the promo only fires on the
+        # exact SKUs added to the right panel — not the department label.
+        banner = QLabel(
+            "⚠  Add every SKU this promo should apply to. The promo will "
+            "only fire on items in the right panel — picking just a department "
+            "name is not enough."
+        )
+        banner.setWordWrap(True)
+        banner.setStyleSheet(
+            "background: #FEF7E0; color: #8A5A00; border: 1px solid #F1C40F;"
+            " border-radius: 6px; padding: 8px 12px; font-size: 10pt;"
+        )
+        wv.addWidget(banner)
+
         # Filter row
         flt = QHBoxLayout()
         flt.setSpacing(8)
