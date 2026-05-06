@@ -255,6 +255,25 @@ class MainWindow(QMainWindow):
     def _on_login_succeeded(self, user: User) -> None:
         log.info("login OK: %s (role=%s)", user.name, user.role)
         self._current_user = user
+        # First-launch protection: if an admin still has the factory
+        # default PIN, force them through ForcePinChangeDialog before
+        # they can reach the register/dashboard. Cashiers don't go
+        # through this — admin manages their PINs from Users screen.
+        if user.role == "admin":
+            try:
+                from ui.onboarding import is_default_pin, ForcePinChangeDialog
+                if is_default_pin(user):
+                    dlg = ForcePinChangeDialog(user, parent=self)
+                    if dlg.exec() != QDialog.DialogCode.Accepted:
+                        # Admin closed without setting — bounce to login.
+                        self._show_login()
+                        return
+                    # Refresh in-memory user so subsequent flows see new hash.
+                    row = db.get_user(user.id)
+                    if row is not None:
+                        self._current_user = User.from_row(row)
+            except Exception:
+                log.exception("forced PIN-change dialog failed")
         # Admins start in the register so they can ring sales immediately,
         # then jump to admin dashboard via the footer button without
         # re-entering their PIN. Cashiers go straight to register.
