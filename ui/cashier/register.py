@@ -688,13 +688,22 @@ class RegisterScreen(QWidget):
         self._search_input.setPlaceholderText("Scan barcode or enter SKU")
         # Force compact text-keyboard popup (not the numeric variant).
         self._search_input.setProperty("touchKeyboard", "text")
-        self._search_input.setStyleSheet(
-            "QLineEdit { background: transparent; border: none;"
-            " font-size: 16pt; color: #333; padding: 4px; }"
-            "QLineEdit::placeholder { color: #888; }"
-        )
+        self._search_input.setStyleSheet(self._SEARCH_BASE_QSS)
         self._search_input.returnPressed.connect(self._on_search_submit)
+        # Hook focus events to drive the scanner-ready status dot.
+        self._search_input.installEventFilter(self)
         iw.addWidget(self._search_input, stretch=1)
+
+        # Scanner-ready status dot (green = focused, grey = lost).
+        self._scan_dot = QLabel("●")
+        self._scan_dot.setObjectName("scan_status_dot")
+        self._scan_dot.setFixedSize(28, 36)
+        self._scan_dot.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        sf = QFont(styles.FONT_FAMILY, 16); sf.setBold(True)
+        self._scan_dot.setFont(sf)
+        self._scan_dot.setToolTip("Scanner ready")
+        self._scan_dot.setStyleSheet("color: #B0BEC5; background: transparent;")
+        iw.addWidget(self._scan_dot)
         h.addWidget(input_wrap, stretch=1)
 
         # < back (grey circle)
@@ -746,6 +755,33 @@ class RegisterScreen(QWidget):
                 self._search_input.setFocus()
         except Exception:
             pass
+
+    def _set_scan_status(self, ready: bool) -> None:
+        """Update the scanner-ready indicator next to the search field."""
+        if not hasattr(self, "_scan_dot") or self._scan_dot is None:
+            return
+        if ready:
+            self._scan_dot.setStyleSheet(
+                "color: #27AE60; background: transparent;"
+            )
+            self._scan_dot.setToolTip("Scanner ready — search field is focused")
+        else:
+            self._scan_dot.setStyleSheet(
+                "color: #B0BEC5; background: transparent;"
+            )
+            self._scan_dot.setToolTip(
+                "Scanner inactive — tap search field or press Esc to refocus"
+            )
+
+    def eventFilter(self, obj, ev) -> bool:
+        # Track focus on the search field to drive the scan-ready dot.
+        if obj is getattr(self, "_search_input", None):
+            from PyQt6.QtCore import QEvent
+            if ev.type() == QEvent.Type.FocusIn:
+                self._set_scan_status(True)
+            elif ev.type() == QEvent.Type.FocusOut:
+                self._set_scan_status(False)
+        return super().eventFilter(obj, ev)
 
     def _flash_search(self, color: str) -> None:
         """Brief border flash on the search field (~280ms).
@@ -1929,6 +1965,7 @@ class RegisterScreen(QWidget):
         self.cart.set_quantity(idx, new_qty)
         self.cart_widget.refresh()
         self._numpad_clear()
+        self._focus_search()
 
     def _on_void(self) -> None:
         # Void selected cart line (different from voiding a completed transaction).
@@ -1940,6 +1977,7 @@ class RegisterScreen(QWidget):
         self.cart.remove_line(idx)
         self.cart_widget.refresh()
         self._refresh_deals_banner()
+        self._focus_search()
 
     def _on_cancel_item(self) -> None:
         self._on_void()   # alias: cancel selected line
@@ -2094,6 +2132,7 @@ class RegisterScreen(QWidget):
         self.cart_widget.refresh()
         self._refresh_held_count()
         self._refresh_deals_banner()
+        self._focus_search()
         # No info dialog; HELD pill above the cart is the visual confirmation
 
     def _on_retrieve(self) -> None:
