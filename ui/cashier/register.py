@@ -723,6 +723,50 @@ class RegisterScreen(QWidget):
 
         return bar
 
+    # ─── Scanner focus + flash helpers ──────────────────────────────────────
+
+    _SEARCH_BASE_QSS = (
+        "QLineEdit { background: transparent; border: none;"
+        " font-size: 16pt; color: #333; padding: 4px; }"
+        "QLineEdit::placeholder { color: #888; }"
+    )
+
+    def _focus_search(self) -> None:
+        """Return keyboard focus to the scan/search field.
+
+        No-op if a modal dialog is currently open (PIN entry, payment
+        sheet, popup confirmations) so the scanner doesn't yank focus
+        out of the cashier's interaction.
+        """
+        try:
+            from PyQt6.QtWidgets import QApplication
+            if QApplication.activeModalWidget() is not None:
+                return
+            if hasattr(self, "_search_input") and self._search_input is not None:
+                self._search_input.setFocus()
+        except Exception:
+            pass
+
+    def _flash_search(self, color: str) -> None:
+        """Brief border flash on the search field (~280ms).
+
+        color: hex string. Green = successful scan, red = unknown barcode.
+        """
+        if not hasattr(self, "_search_input") or self._search_input is None:
+            return
+        flash_qss = (
+            self._SEARCH_BASE_QSS
+            + f"QLineEdit {{ border: 2px solid {color}; border-radius: 6px; }}"
+        )
+        try:
+            self._search_input.setStyleSheet(flash_qss)
+            QTimer.singleShot(
+                280,
+                lambda: self._search_input.setStyleSheet(self._SEARCH_BASE_QSS),
+            )
+        except Exception:
+            pass
+
     def _on_search_clear(self) -> None:
         # X clears BOTH the search box and the ENTERED amount buffer.
         # Closes any open touch keyboard and drops focus from the search input.
@@ -748,6 +792,8 @@ class RegisterScreen(QWidget):
             self.cart_widget.refresh(flash_index=idx)
             self._refresh_deals_banner()
             self._search_input.clear()
+            self._flash_search("#27AE60")    # green = success
+            self._focus_search()
             return
         # Fallback: partial name/barcode search → picker dialog.
         try:
@@ -758,10 +804,13 @@ class RegisterScreen(QWidget):
         if not results:
             self._info(f"No results for '{text}'.")
             self._search_input.clear()
+            self._flash_search("#E74C3C")    # red = unknown
+            self._focus_search()
             return
         dlg = ItemPickerDialog(results, parent=self, initial_query=text)
         if dlg.exec() != QDialog.DialogCode.Accepted or dlg.picked is None:
             self._search_input.clear()
+            self._focus_search()
             return
         from core.models import Item
         ln = self.cart.add_item(Item.from_row(dlg.picked))
@@ -769,6 +818,8 @@ class RegisterScreen(QWidget):
         self.cart_widget.refresh(flash_index=idx)
         self._refresh_deals_banner()
         self._search_input.clear()
+        self._flash_search("#27AE60")
+        self._focus_search()
 
     def _on_search_back(self) -> None:
         self._stub("Search history back")
@@ -1153,13 +1204,17 @@ class RegisterScreen(QWidget):
         row = db.get_item_by_barcode(barcode)
         if row is None:
             # New flow: offer to add the item right now (cashier-side quick add).
+            self._flash_search("#E74C3C")    # red = unknown
             self._on_unknown_barcode(barcode)
+            self._focus_search()
             return
         from core.models import Item
         ln = self.cart.add_item(Item.from_row(row))
         idx = self.cart.lines.index(ln)
         self.cart_widget.refresh(flash_index=idx)
         self._refresh_deals_banner()
+        self._flash_search("#27AE60")
+        self._focus_search()
 
     # ─── department / manual entry ───────────────────────────────────────────
 
@@ -1391,6 +1446,7 @@ class RegisterScreen(QWidget):
         self._numpad_clear()
         self.cart_widget.refresh()
         self._refresh_deals_banner()
+        self._focus_search()
 
     def _finalize_cash(self, tender_cents: int, change_cents: int) -> None:
         t = self.cart.totals
@@ -1457,6 +1513,7 @@ class RegisterScreen(QWidget):
         self._numpad_clear()
         self.cart_widget.refresh()
         self._refresh_deals_banner()
+        self._focus_search()
 
     def _open_cash_drawer(self) -> None:
         log.info("[STUB] cash drawer kick signal")
@@ -1839,6 +1896,7 @@ class RegisterScreen(QWidget):
         self._numpad_clear()
         self.cart_widget.refresh()
         self._refresh_deals_banner()
+        self._focus_search()
 
     def _on_bag(self) -> None:
         ln = self.cart.add_bag_charge()
@@ -2056,6 +2114,16 @@ class RegisterScreen(QWidget):
 
     def _on_override_price(self) -> None:
         self._stub("Override Price (admin PIN required)")
+
+    # ─── Lifecycle ──────────────────────────────────────────────────────────
+
+    def showEvent(self, ev) -> None:
+        """Auto-focus the scan/search field whenever the register surface
+        becomes visible (login, return-from-admin, after lock unlock)."""
+        super().showEvent(ev)
+        # Defer one event-loop tick so child widgets are fully realized
+        # before requesting focus.
+        QTimer.singleShot(0, self._focus_search)
 
     # ─── Dialog helpers ──────────────────────────────────────────────────────
 
