@@ -364,13 +364,13 @@ class RegisterScreen(QWidget):
         v = QVBoxLayout(container)
         v.setSpacing(2)
         v.setContentsMargins(2, 2, 2, 2)
-        # Single compact row — frees ~50px of vertical space for the numpad.
+        # Single compact row. Stub-only actions (Override Price, Price
+        # Check) hidden until wired — production UI must have zero fake
+        # buttons (Roadmap §5).
         h1 = QHBoxLayout(); h1.setSpacing(3)
         for label, name, color_key, slot in [
             ("Cancel Item",    "act_cancel_item",    "btn_cancel",  self._on_cancel_item),
             ("No Sale",        "act_no_sale",        "btn_no_sale", self._on_no_sale),
-            ("Override Price", "act_override_price", "btn_void",    self._on_override_price),
-            ("Price Check",    "act_price_check",    "btn_hold",    self._on_price_check),
         ]:
             b = self._mk_action(label, name, color_key, height=42)
             b.clicked.connect(slot)
@@ -706,30 +706,8 @@ class RegisterScreen(QWidget):
         iw.addWidget(self._scan_dot)
         h.addWidget(input_wrap, stretch=1)
 
-        # < back (grey circle)
-        self._search_back_btn = QPushButton("<")
-        self._search_back_btn.setObjectName("search_back")
-        self._search_back_btn.setFixedSize(36, 36)
-        self._search_back_btn.setStyleSheet(
-            "QPushButton { background-color: #B0B0B0; color: white;"
-            " border: none; border-radius: 18px;"
-            " font-weight: bold; font-size: 14pt; }"
-        )
-        self._search_back_btn.clicked.connect(self._on_search_back)
-        h.addWidget(self._search_back_btn)
-
-        # SKU PLU blue rectangle (2-line text)
-        self._search_sku_btn = QPushButton("SKU\nPLU")
-        self._search_sku_btn.setObjectName("search_sku_plu")
-        self._search_sku_btn.setFixedSize(72, 40)
-        self._search_sku_btn.setStyleSheet(
-            "QPushButton { background-color: #2196F3; color: white;"
-            " border: none; border-radius: 4px;"
-            " font-weight: bold; font-size: 10pt; }"
-        )
-        self._search_sku_btn.clicked.connect(self._on_sku_plu)
-        h.addWidget(self._search_sku_btn)
-
+        # Stub buttons (search-back, SKU/PLU) removed — search bar already
+        # handles SKU + barcode + partial-name lookup. (Roadmap §5)
         return bar
 
     # ─── Scanner focus + flash helpers ──────────────────────────────────────

@@ -302,13 +302,14 @@ class AdminReportsScreen(QWidget):
         self._kpis: dict[str, KPICard] = {}
         kpi_grid = QGridLayout()
         kpi_grid.setSpacing(10)
+        # Scan Ratio KPI deliberately omitted until per-line scan flag
+        # is wired to transaction_items (Roadmap §5 — no fake data).
         kpi_layout = [
             ("Baskets",          "#2E5BA8"),
             ("Items Sold",       "#27AE60"),
             ("Net Sales",        "#16A085"),
             ("Avg Basket",       "#7D3C98"),
             ("Avg Items",        "#2980B9"),
-            ("Scan Ratio",       "#E67E22"),
             ("Lottery Sales",    "#6C3483"),
             ("Retail Sales",     "#1B3A6B"),
             ("Refund/Voids",     "#E74C3C"),
@@ -585,12 +586,8 @@ class AdminReportsScreen(QWidget):
                           _money(r["amount_cents"])]
                          for r in voids])})
         )
-        # 10. Scan Ratio breakdown — placeholder until per-line scan flag wired
-        self._sections_payload.append(("Scan Ratio", [
-            ("Scanned items",      str(items_sold)),
-            ("Manual entries",     "0"),
-            ("Scan ratio",         f"{scan_ratio:.1f}%"),
-        ]))
+        # 10. Scan Ratio section deliberately omitted — wire when the
+        # `scanned` flag is added to transaction_items (Roadmap §5).
 
         # Stash for shift list + receipt/PDF builders.
         self._shifts = shifts
@@ -603,7 +600,6 @@ class AdminReportsScreen(QWidget):
         self._kpis["Net Sales"].set_value(_money(d.get("net_sales", 0)))
         self._kpis["Avg Basket"].set_value(_money(d.get("avg_basket", 0)))
         self._kpis["Avg Items"].set_value(f"{d.get('avg_items', 0):.1f}")
-        self._kpis["Scan Ratio"].set_value(f"{d.get('scan_ratio', 0):.1f}%")
         self._kpis["Lottery Sales"].set_value(_money(d.get("lottery_sales", 0)))
         self._kpis["Retail Sales"].set_value(_money(d.get("retail_sales", 0)))
         self._kpis["Refund/Voids"].set_value(str(d.get("voids", 0)))
