@@ -43,42 +43,38 @@ PIN_LENGTH = 4
 SUBMIT_DELAY_MS = 120          # tiny pause so user sees the last dot fill
 LOCK_POLL_INTERVAL_MS = 1000
 LOGO_PATH = Path("assets/logo.png")
-LOGO_TARGET_HEIGHT = 96        # px; preserves aspect ratio
+LOGO_TARGET_HEIGHT = 120       # px; preserves aspect ratio
 
 
 def _login_qss() -> str:
-    """Premium dark-grey gradient + per-element styling for login surface."""
+    """Premium light-grey gradient. Logo + PIN dots float on background
+    (no boxed containers). Dark keypad preserved."""
     c = styles.COLORS
     return (
-        # Whole screen background gradient — subtle navy-grey blend
+        # Light cool-grey gradient bg
         f"QWidget#login_screen {{"
         f"  background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
-        f"      stop:0 #2A3949, stop:0.55 #1F2A38, stop:1 #16202D);"
+        f"      stop:0 #F2F5F8, stop:0.55 #E4E8EE, stop:1 #D6DCE3);"
         f"}}"
-        # Center card
-        f"QFrame#login_card {{"
-        f"  background-color: rgba(255,255,255,0.04);"
-        f"  border: 1px solid rgba(255,255,255,0.08);"
-        f"  border-radius: 16px;"
+        # Card is invisible — provides layout only.
+        f"QFrame#login_card {{ background: transparent; border: none; }}"
+        # Logo subtitle (medium grey on light bg)
+        f"QLabel#logo_subtitle {{ color: #6B7787; letter-spacing: 2px;"
+        f"  font-size: 11pt; font-weight: bold; background: transparent; }}"
+        f"QLabel#store_name {{ color: #5A6573; font-size: 11pt;"
+        f"  background: transparent; }}"
+        # PIN dots float directly on bg — no frame box.
+        f"QFrame#pin_display_frame {{ background: transparent; border: none; }}"
+        f"QLabel[pinDot=\"true\"] {{"
+        f"  color: #B0BEC5; background: transparent;"
         f"}}"
-        # Logo subtitle
-        f"QLabel#logo_subtitle {{ color: #A8B2BD; letter-spacing: 2px;"
-        f"  font-size: 11pt; font-weight: bold; }}"
-        f"QLabel#store_name {{ color: #DCE3EA; font-size: 11pt; }}"
-        # PIN dots frame + dots
-        f"QFrame#pin_display_frame {{"
-        f"  background-color: rgba(0,0,0,0.18);"
-        f"  border: 1px solid rgba(255,255,255,0.10);"
-        f"  border-radius: 10px;"
-        f"}}"
-        f"QLabel[pinDot=\"true\"] {{ color: rgba(255,255,255,0.25); }}"
-        f"QLabel[pinDot=\"true\"][filled=\"true\"] {{ color: #6FB3FF; }}"
+        f"QLabel[pinDot=\"true\"][filled=\"true\"] {{ color: {c['blue_mid']}; }}"
         # Numpad digits (matte charcoal, blue accent on hover)
         f"QPushButton[loginKey=\"digit\"] {{"
         f"  background-color: #2D3A4A; color: #FFFFFF;"
         f"  border: 1px solid #3A4A5C; border-radius: 12px;"
         f"  font-size: 22pt; font-weight: bold;"
-        f"  min-width: 84px; min-height: 76px;"
+        f"  min-width: 88px; min-height: 78px;"
         f"}}"
         f"QPushButton[loginKey=\"digit\"]:hover {{"
         f"  background-color: #34465B; border: 1px solid {c['blue_mid']};"
@@ -87,14 +83,14 @@ def _login_qss() -> str:
         f"  background-color: {c['blue_mid']}; padding-top: 2px;"
         f"}}"
         f"QPushButton[loginKey=\"digit\"]:disabled {{"
-        f"  background-color: #25303D; color: #5A6573; border: 1px solid #2D3A4A;"
+        f"  background-color: #98A1AC; color: #DDE2E7; border: 1px solid #98A1AC;"
         f"}}"
-        # CLR (orange/red)
+        # CLR (orange)
         f"QPushButton[loginKey=\"clr\"] {{"
         f"  background-color: #E67E22; color: white;"
         f"  border: none; border-radius: 12px;"
         f"  font-size: 14pt; font-weight: bold;"
-        f"  min-width: 84px; min-height: 76px;"
+        f"  min-width: 88px; min-height: 78px;"
         f"}}"
         f"QPushButton[loginKey=\"clr\"]:hover {{ background-color: #D35400; }}"
         # Backspace (slate)
@@ -102,12 +98,14 @@ def _login_qss() -> str:
         f"  background-color: #3F4C5C; color: white;"
         f"  border: none; border-radius: 12px;"
         f"  font-size: 22pt; font-weight: bold;"
-        f"  min-width: 84px; min-height: 76px;"
+        f"  min-width: 88px; min-height: 78px;"
         f"}}"
         f"QPushButton[loginKey=\"back\"]:hover {{ background-color: #4F5D6E; }}"
-        # Status label
-        f"QLabel#login_status {{ color: #A8B2BD; font-size: 11pt; }}"
-        f"QLabel#login_status[class=\"danger\"] {{ color: #FF7C7C; font-weight: bold; }}"
+        # Status label (darker on light bg)
+        f"QLabel#login_status {{ color: #5A6573; font-size: 11pt;"
+        f"  background: transparent; }}"
+        f"QLabel#login_status[class=\"danger\"] {{ color: #C0392B;"
+        f"  font-weight: bold; background: transparent; }}"
     )
 
 
@@ -150,8 +148,8 @@ class LoginScreen(QWidget):
         card.setObjectName("login_card")
         card.setFixedWidth(420)
         cv = QVBoxLayout(card)
-        cv.setContentsMargins(28, 32, 28, 28)
-        cv.setSpacing(20)
+        cv.setContentsMargins(28, 36, 28, 28)
+        cv.setSpacing(28)
         cv.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         cv.addWidget(self._build_header(store_name),
@@ -190,44 +188,64 @@ class LoginScreen(QWidget):
         return header
 
     def _build_logo_label(self) -> QLabel:
-        """Load assets/logo.png. Fall back to text 'CITYLINK' if missing or invalid.
-        Soft glow behind the mark via QGraphicsDropShadowEffect.
+        """Load assets/logo.png. Fall back to text 'CITYLINK' if missing.
+
+        Resolves path relative to the project root (so the asset loads even
+        when the app is launched from a different cwd). Adds a subtle drop
+        shadow for depth on the light background.
         """
         logo = QLabel()
         logo.setObjectName("logo_text")
         logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        logo.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        logo.setStyleSheet("background: transparent;")
 
+        # Resolve logo path relative to this module's project root so the
+        # asset loads regardless of the launch cwd.
+        candidate_paths = [
+            LOGO_PATH,
+            Path(__file__).resolve().parent.parent / "assets" / "logo.png",
+        ]
         pixmap: QPixmap | None = None
-        if LOGO_PATH.exists():
-            pm = QPixmap(str(LOGO_PATH))
-            if not pm.isNull():
-                # Smooth aspect-ratio-preserving scale.
-                pixmap = pm.scaledToHeight(
-                    LOGO_TARGET_HEIGHT,
-                    Qt.TransformationMode.SmoothTransformation,
-                )
+        used_path: Path | None = None
+        for p in candidate_paths:
+            try:
+                if p.exists():
+                    pm = QPixmap(str(p))
+                    if not pm.isNull():
+                        pixmap = pm.scaledToHeight(
+                            LOGO_TARGET_HEIGHT,
+                            Qt.TransformationMode.SmoothTransformation,
+                        )
+                        used_path = p
+                        break
+            except Exception:
+                log.exception("logo load attempt failed: %s", p)
 
         if pixmap is not None:
             logo.setPixmap(pixmap)
-            logo.setStyleSheet("background: transparent;")
+            logo.setFixedSize(pixmap.size())
+            log.info("login logo loaded from %s (%dx%d)",
+                     used_path, pixmap.width(), pixmap.height())
         else:
-            log.warning("logo asset missing or invalid (%s) — using text fallback", LOGO_PATH)
+            log.warning("logo asset missing/invalid; tried %s", candidate_paths)
             logo.setText("CITYLINK")
-            f = QFont(styles.FONT_FAMILY, 36)
-            f.setBold(True)
+            f = QFont(styles.FONT_FAMILY, 40); f.setBold(True)
             logo.setFont(f)
-            logo.setStyleSheet("color: white; background: transparent;"
-                               " letter-spacing: 4px;")
+            logo.setStyleSheet(
+                f"color: {styles.COLORS['navy']}; background: transparent;"
+                f" letter-spacing: 4px;"
+            )
 
-        # Soft glow behind the logo.
+        # Subtle depth shadow.
         try:
             from PyQt6.QtWidgets import QGraphicsDropShadowEffect
             from PyQt6.QtGui import QColor as _QC
-            shadow = QGraphicsDropShadowEffect(logo)
-            shadow.setBlurRadius(36)
-            shadow.setOffset(0, 0)
-            shadow.setColor(_QC(91, 155, 213, 140))   # blue glow
-            logo.setGraphicsEffect(shadow)
+            sh = QGraphicsDropShadowEffect(logo)
+            sh.setBlurRadius(24)
+            sh.setOffset(0, 4)
+            sh.setColor(_QC(0, 0, 0, 60))
+            logo.setGraphicsEffect(sh)
         except Exception:
             pass
         return logo
