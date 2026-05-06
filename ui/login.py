@@ -138,19 +138,18 @@ class LoginScreen(QWidget):
 
     def _build_ui(self, store_name: str) -> None:
         root = QVBoxLayout(self)
-        root.setContentsMargins(40, 40, 40, 40)
+        root.setContentsMargins(40, 32, 40, 60)
         root.setSpacing(0)
-        root.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        root.addStretch(1)
 
-        # Centered card holds header + pin dots + numpad + status
+        # Card holds header + pin dots + numpad + status. Sits in upper-mid
+        # of screen — bottom stretch is heavier so the keypad doesn't clip
+        # against the lower edge on shorter windows.
         card = QFrame()
         card.setObjectName("login_card")
         card.setFixedWidth(420)
         cv = QVBoxLayout(card)
-        cv.setContentsMargins(28, 36, 28, 28)
-        cv.setSpacing(28)
-        cv.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        cv.setContentsMargins(28, 28, 28, 24)
+        cv.setSpacing(22)
 
         cv.addWidget(self._build_header(store_name),
                      alignment=Qt.AlignmentFlag.AlignCenter)
@@ -161,8 +160,9 @@ class LoginScreen(QWidget):
         cv.addWidget(self._build_status(),
                      alignment=Qt.AlignmentFlag.AlignCenter)
 
-        root.addWidget(card, alignment=Qt.AlignmentFlag.AlignCenter)
         root.addStretch(1)
+        root.addWidget(card, alignment=Qt.AlignmentFlag.AlignHCenter)
+        root.addStretch(3)
 
     def _build_header(self, store_name: str) -> QWidget:
         header = QFrame()
