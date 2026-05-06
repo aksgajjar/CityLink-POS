@@ -1192,14 +1192,16 @@ class RegisterScreen(QWidget):
             self._numpad_input(ch)
 
     def _on_cash(self) -> None:
-        """Cash press supports SPLIT payments.
+        """Cash press — supports split payments AND negative-total settlements.
 
-        Buffer empty + no prior partials → exact payment.
-        Buffer < remaining → partial: accumulate, transaction stays open.
-        Buffer >= remaining → finalize (cash-only or split if prior partials).
+        Tender model uses signed `net_owed = rounded_total - prior_cash_partial`:
+          net_owed > 0  → customer owes; existing partial / exact / change flow.
+          net_owed == 0 → balanced; finalize with zero tender + zero change.
+          net_owed < 0  → store owes; cash back to customer (lottery payout
+                          and/or partial refund of prior partials).
 
-        Special case: cart total < 0 (lottery payout only) → finalize as
-        payout transaction without partial/change/paid-in-full logic.
+        The legacy "Already paid in full" message only fires when prior
+        partials already covered the bill (rounded > 0 but net_owed ≤ 0).
         """
         self._last_dept_add = None
         if self._payment_locked:
@@ -1210,41 +1212,64 @@ class RegisterScreen(QWidget):
             return
         rounded = self.cart.totals["rounded_total_cents"]
         partial = self._cash_partial_cents
-        # ── Lottery payout flow: cart total negative, cashier hands money OUT.
-        # Skip tender/change/partial logic; finalize directly.
-        if rounded < 0 and partial == 0 and self._is_payout_only_cart():
+        net_owed = rounded - partial
+
+        # ── Negative or zero rounded total: settle as cash-back / payout.
+        # Customer is either being paid out (rounded < 0) or breaks even
+        # (rounded == 0). Skip tender/partial/paid-in-full logic.
+        if rounded <= 0:
+            cash_back = max(0, -rounded) + max(0, partial)
             self._payment_locked = True
             try:
-                self._finalize_payout(rounded)
+                self._finalize_cash_back(prior_partial_cents=partial,
+                                          cash_back_cents=cash_back)
             finally:
                 self._payment_locked = False
             return
-        remaining = rounded - partial
-        if remaining <= 0:
-            self._info("Already paid in full. Press Cancel to clear or scan next sale.")
+
+        # ── Positive rounded total but already covered by prior partials.
+        if net_owed <= 0:
+            # Overpaid via partials → return the excess as cash-back.
+            excess = -net_owed
+            if excess > 0:
+                self._payment_locked = True
+                try:
+                    self._finalize_cash_back(prior_partial_cents=partial,
+                                              cash_back_cents=excess)
+                finally:
+                    self._payment_locked = False
+                return
+            # Exactly covered → finalize cleanly.
+            self._payment_locked = True
+            try:
+                self._cash_partial_cents = 0
+                self._finalize_cash(tender_cents=partial, change_cents=0)
+            finally:
+                self._payment_locked = False
             return
+
+        # ── Positive net_owed: existing tender flow.
         raw = self._numpad_cents()
         if raw == 0:
             # Empty buffer → tender exactly the remaining amount (no change).
             self._payment_locked = True
             try:
-                tender_total = partial + remaining
+                tender_total = partial + net_owed
                 self._cash_partial_cents = 0
                 self._finalize_cash(tender_total, 0)
             finally:
                 self._payment_locked = False
             return
-        if raw < remaining:
+        if raw < net_owed:
             # Partial cash payment — accumulate silently. No popup.
-            # Cart's total band shows remaining via update_partial_paid.
             self._cash_partial_cents += raw
             self._numpad_clear()
             self.cart_widget.totals_panel.set_partial_paid(self._cash_partial_cents)
             return
-        # Full or over — finalize with combined tender. Lock to block re-entry.
+        # Full or over — finalize with combined tender.
         self._payment_locked = True
         try:
-            change = raw - remaining
+            change = raw - net_owed
             tender_total = partial + raw
             self._cash_partial_cents = 0
             self._finalize_cash(tender_total, change)
@@ -1265,18 +1290,24 @@ class RegisterScreen(QWidget):
             return False
         return any_payout
 
-    def _finalize_payout(self, rounded_cents: int) -> None:
-        """Lottery-payout-only finalize.
+    def _finalize_cash_back(self, *, prior_partial_cents: int,
+                             cash_back_cents: int) -> None:
+        """Finalize when net_owed <= 0 (store owes customer or balanced).
 
-        rounded_cents is negative. We:
-          - Save txn with payment_method="payout".
-          - Open cash drawer (cashier dispenses winnings).
-          - Optionally print payout receipt.
-          - Show premium 'Payout Completed' popup (NOT change-due).
-          - Clear cart.
+        prior_partial_cents → money already collected from customer (from
+        prior partial cash tenders that we now refund / reconcile).
+        cash_back_cents     → total money to hand BACK to customer at the
+                              drawer (lottery winnings + any partial refund).
+
+        Saves transaction, opens drawer, optionally prints receipt, shows
+        the appropriate completion popup.
         """
         t = self.cart.totals
         ref = db.next_transaction_ref()
+        rounded = t["rounded_total_cents"]
+        # Pure-payout cart → tag as payout for ledger reporting; mixed
+        # carts (any retail/bag line) tag as cash for normal sale reporting.
+        method = "payout" if self._is_payout_only_cart() else "cash"
         txn = Transaction(
             transaction_ref=ref,
             subtotal_cents=t["subtotal_cents"],
@@ -1286,10 +1317,10 @@ class RegisterScreen(QWidget):
             deposit_cents=t["deposit_cents"],
             bag_charge_cents=t["bag_charge_cents"],
             total_cents=t["total_cents"],
-            rounded_total_cents=t["rounded_total_cents"],
-            payment_method="payout",
-            cash_tendered_cents=0,
-            change_cents=0,
+            rounded_total_cents=rounded,
+            payment_method=method,
+            cash_tendered_cents=prior_partial_cents,
+            change_cents=cash_back_cents,
             cashier_id=self.cashier.id,
             cashier_name=self.cashier.name,
             shift_id=self.shift_id,
@@ -1298,7 +1329,7 @@ class RegisterScreen(QWidget):
         items_data = [ln.to_db_dict() for ln in self.cart.lines]
         lottery_records = [
             {
-                "entry_type": "payout",
+                "entry_type": "payout" if ln.unit_price_cents < 0 else "sale",
                 "amount_cents": abs(ln.unit_price_cents) * ln.quantity,
                 "cashier_name": self.cashier.name,
                 "shift_id": self.shift_id,
@@ -1311,34 +1342,44 @@ class RegisterScreen(QWidget):
                 txn.header_dict(), items_data, lottery_records,
             )
         except Exception:
-            log.exception("payout transaction insert failed")
-            self._error("Failed to save payout. See errors.log.")
+            log.exception("cash-back transaction insert failed")
+            self._error("Failed to save transaction. See errors.log.")
             return
 
         self._open_cash_drawer()
         self._last_txn = txn
         self._last_tid = tid
-        # Soft retail confirmation sound (reuse cash MP3; quieter than sale).
         self._play_chaching()
 
-        # Optional receipt — same Print? prompt as card flow.
-        payout_amount = abs(rounded_cents)
+        # Receipt prompt — same UX as card flow.
+        prd_title = "Payout Receipt?" if method == "payout" else "Receipt Options"
+        prd_subtitle = (
+            f"Print payout receipt for ${cash_back_cents/100:.2f}?"
+            if method == "payout" else "Print customer receipt?"
+        )
         prd = PrintReceiptDialog(
             parent=self,
-            title="Payout Receipt?",
-            subtitle=f"Print payout receipt for ${payout_amount/100:.2f}?",
-            detail=f"PAYOUT  ·  {ref}",
-            ok_label="Print Receipt",
+            title=prd_title,
+            subtitle=prd_subtitle,
+            detail=f"{'PAYOUT' if method == 'payout' else 'CASH'}  ·  {ref}",
         )
+        print_ok = True
         if prd.exec() == QDialog.DialogCode.Accepted:
             try:
                 self._print_receipt(txn, tid)
             except Exception:
-                log.exception("payout receipt print failed")
-                self._error("Payout saved but receipt failed to print. Use Reprint.")
+                log.exception("receipt print failed")
+                print_ok = False
+                self._error("Saved but receipt failed to print. Use Reprint.")
 
-        # Premium 'Payout Completed' confirmation (not Change Due).
-        PayoutCompleteDialog(ref, payout_amount, parent=self).exec()
+        # Completion popup — distinct visuals for pure-payout vs mixed.
+        if cash_back_cents > 0:
+            if method == "payout":
+                PayoutCompleteDialog(ref, cash_back_cents, parent=self).exec()
+            else:
+                # Mixed cart settling negative → use Change Due dialog.
+                ChangeDialog(ref, cash_back_cents, parent=self).exec()
+        # else (zero-net): cleanly clear without popup.
 
         # Reset register state.
         self.cart.clear()
@@ -1534,11 +1575,17 @@ class RegisterScreen(QWidget):
         self._payment_locked = True
 
         # Card charges only the REMAINING balance after any cash partials.
+        # Card terminal cannot dispense cash, so negative/zero balances
+        # must be settled via the Cash button (cash drawer).
         total_cents = self.cart.totals["total_cents"]
         partial = self._cash_partial_cents
         amount = total_cents - partial
         if amount <= 0:
-            self._error("Total is $0 — nothing to charge.")
+            self._payment_locked = False
+            if total_cents < 0:
+                self._error("Cart has cash back due — press CASH to settle.")
+            else:
+                self._error("Nothing to charge — press CASH to settle.")
             return
 
         self._pending_card_req = PaymentRequest(
