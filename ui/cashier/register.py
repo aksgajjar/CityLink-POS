@@ -1657,8 +1657,9 @@ class RegisterScreen(QWidget):
         self._last_txn = txn
         self._last_tid = tid
         last4 = resp.card_last4 or "????"
-        # Card path does NOT play cha-ching (cash-drawer specific) and does NOT
-        # auto-open the cash drawer.
+        # Card path: play CardPayment.mp3 (digital approval feel). No
+        # cash-drawer side effects.
+        self._play_card_approved()
         dlg = PrintReceiptDialog(
             parent=self,
             subtitle="Print receipt for the customer?",

@@ -205,12 +205,21 @@ class MainWindow(QMainWindow):
         # Returned regardless of connect outcome — UI inspects is_connected().
         self.terminal: PaymentTerminal = get_terminal(config)
 
-        # Sound feedback (click/success/error). WAVs auto-generated at boot.
+        # Sound feedback (click/success/error + payment-completion MP3s).
         snd_cfg = config.get("sound", {}) or {}
         self.sound_player: SoundPlayer = SoundPlayer(
             enabled=bool(snd_cfg.get("enabled", True)),
             volume_pct=int(snd_cfg.get("volume", 80)),
         )
+        # Bind centralized sound manager so any module can call
+        # sound_manager.play_cash_sound() / play_card_sound() without holding
+        # a SoundPlayer reference.
+        try:
+            from core import sound_manager
+            sound_manager.bind(self.sound_player)
+            sound_manager.preload_sounds()
+        except Exception:
+            log.exception("sound_manager bind failed")
 
         self.setStyleSheet(styles.get_stylesheet())
 
