@@ -109,6 +109,7 @@ class AdminDashboard(QWidget):
     """Admin home: stats header + 2×3 cards + back/logout."""
 
     logout_requested = pyqtSignal()
+    register_requested = pyqtSignal()   # admin wants to switch to register
 
     def __init__(
         self,
@@ -271,6 +272,22 @@ class AdminDashboard(QWidget):
         h = QHBoxLayout(bar)
         h.setContentsMargins(20, 6, 20, 6)
         h.addStretch(1)
+        # "Open Register" — admin can switch to cashier surface without
+        # logging out (admin role inherits cashier privileges).
+        reg_btn = QPushButton("Open Register")
+        reg_btn.setObjectName("admin_dash_register")
+        reg_btn.setMinimumSize(180, 36)
+        rf = QFont(styles.FONT_FAMILY, 12); rf.setBold(True)
+        reg_btn.setFont(rf)
+        reg_btn.setStyleSheet(
+            "QPushButton { background-color: rgba(255,255,255,0.1); color: white;"
+            " border: 1px solid white; border-radius: 6px; padding: 6px 16px; }"
+            "QPushButton:hover { background-color: rgba(255,255,255,0.2); }"
+        )
+        reg_btn.clicked.connect(self.register_requested.emit)
+        h.addWidget(reg_btn)
+        h.addSpacing(8)
+
         b = QPushButton("Lock — Back to PIN")
         b.setObjectName("admin_dash_logout")
         b.setMinimumSize(220, 36)

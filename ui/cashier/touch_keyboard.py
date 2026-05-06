@@ -161,11 +161,27 @@ class TouchNumKeyboard(_BaseKeyboard):
         v.setContentsMargins(8, 6, 8, 8)
         v.setSpacing(4)
 
+        # Header row with ✕ close button (touch-friendly dismiss).
+        head_row = QHBoxLayout()
+        head_row.setContentsMargins(0, 0, 0, 0)
+        head_row.setSpacing(0)
         head = QLabel("Numpad")
         head.setObjectName("kbHeader")
         head.setFixedHeight(_HEADER_H)
         head.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        v.addWidget(head)
+        head_row.addWidget(head, stretch=1)
+        close = QPushButton("✕")
+        close.setFixedSize(_HEADER_H, _HEADER_H)
+        close.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        close.setStyleSheet(
+            f"QPushButton {{ background: {_NAVY}; color: white;"
+            f" border: none; font-size: 12pt; font-weight: bold;"
+            f" border-top-right-radius: 4px; }}"
+            f"QPushButton:hover {{ background: #C0392B; }}"
+        )
+        close.clicked.connect(self.close)
+        head_row.addWidget(close)
+        v.addLayout(head_row)
 
         g = QGridLayout()
         g.setSpacing(4)
@@ -215,11 +231,26 @@ class TouchTextKeyboard(_BaseKeyboard):
         outer.setContentsMargins(8, 6, 8, 8)
         outer.setSpacing(4)
 
+        head_row = QHBoxLayout()
+        head_row.setContentsMargins(0, 0, 0, 0)
+        head_row.setSpacing(0)
         head = QLabel("Keyboard")
         head.setObjectName("kbHeader")
         head.setFixedHeight(_HEADER_H)
         head.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        outer.addWidget(head)
+        head_row.addWidget(head, stretch=1)
+        x_close = QPushButton("✕")
+        x_close.setFixedSize(_HEADER_H, _HEADER_H)
+        x_close.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        x_close.setStyleSheet(
+            f"QPushButton {{ background: {_NAVY}; color: white;"
+            f" border: none; font-size: 12pt; font-weight: bold;"
+            f" border-top-right-radius: 4px; }}"
+            f"QPushButton:hover {{ background: #C0392B; }}"
+        )
+        x_close.clicked.connect(self.close)
+        head_row.addWidget(x_close)
+        outer.addLayout(head_row)
 
         body = QHBoxLayout()
         body.setSpacing(8)
@@ -358,6 +389,24 @@ class _TouchKeyboardFilter(QObject):
 
     def eventFilter(self, obj, ev) -> bool:
         et = ev.type()
+        # Outside-click close: if user taps a non-input widget while a
+        # keyboard is open, dismiss the keyboard. The keyboard itself is
+        # a Qt.Tool window so its own clicks don't reach this filter.
+        if (et == QEvent.Type.MouseButtonPress
+                and self._kb is not None
+                and not isinstance(obj, QLineEdit)):
+            from PyQt6.QtWidgets import QPushButton as _QPB
+            # Allow clicks on the active keyboard widget (its child buttons
+            # bubble up through the Tool window — those don't reach here).
+            # Also allow clicks on focus-stealing widgets like buttons that
+            # belong to the keyboard's parent dialog.
+            try:
+                kb_geom = self._kb.frameGeometry()
+                pos = ev.globalPosition().toPoint() if hasattr(ev, "globalPosition") else ev.globalPos()
+                if not kb_geom.contains(pos):
+                    self._focus_out_timer.start()
+            except Exception:
+                pass
         if et == QEvent.Type.FocusIn and isinstance(obj, QLineEdit):
             # Suppress reopen briefly after Enter so focus chains don't
             # spawn a fresh keyboard.

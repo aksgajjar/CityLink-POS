@@ -254,10 +254,10 @@ class MainWindow(QMainWindow):
     def _on_login_succeeded(self, user: User) -> None:
         log.info("login OK: %s (role=%s)", user.name, user.role)
         self._current_user = user
-        if user.role == "admin":
-            self._show_admin()
-        else:
-            self._show_cashier_flow()
+        # Admins start in the register so they can ring sales immediately,
+        # then jump to admin dashboard via the footer button without
+        # re-entering their PIN. Cashiers go straight to register.
+        self._show_cashier_flow()
 
     def _show_cashier_flow(self) -> None:
         # Resume open shift if one exists; otherwise prompt for opening float.
@@ -309,6 +309,7 @@ class MainWindow(QMainWindow):
             store=self.config.get("store", {}),
         )
         self._admin.logout_requested.connect(self._on_logout)
+        self._admin.register_requested.connect(self._on_register_requested)
         self.stack.addWidget(self._admin)
         self.stack.setCurrentWidget(self._admin)
         self._restart_inactivity_timer()
@@ -326,10 +327,52 @@ class MainWindow(QMainWindow):
         self._show_login()
 
     def _on_admin_requested(self) -> None:
-        """Cashier tapped Admin — log them out and require admin PIN re-auth."""
-        log.info("admin requested by cashier %s — locking",
-                 self._current_user.name if self._current_user else "?")
+        """Admin tapped Admin from register — switch to admin dashboard
+        without re-PIN. Cashiers (non-admin) get locked out → PIN screen.
+        """
+        u = self._current_user
+        if u is not None and u.role == "admin":
+            log.info("admin %s switching: register → dashboard", u.name)
+            # Hide the register stack entry but keep its instance + cart
+            # state alive so we can return to it via _on_register_requested.
+            self._show_admin_overlay()
+            return
+        log.info("non-admin tapped Admin — locking to PIN")
         self._on_logout()
+
+    def _on_register_requested(self) -> None:
+        """Admin pressed 'Open Register' on the dashboard — return to the
+        cashier surface without tearing down its state."""
+        if self._register is None:
+            self._show_cashier_flow()
+            return
+        if self._admin is not None:
+            self.stack.removeWidget(self._admin)
+            self._admin.deleteLater()
+            self._admin = None
+        self.stack.setCurrentWidget(self._register)
+        self._register.setFocus()
+        self._restart_inactivity_timer()
+
+    def _show_admin_overlay(self) -> None:
+        """Mount AdminDashboard on top of the existing register session."""
+        from ui.admin.dashboard import AdminDashboard as _AdminDashboard
+        if self._admin is not None:
+            # Already mounted — just bring forward.
+            self.stack.setCurrentWidget(self._admin)
+            self._restart_inactivity_timer()
+            return
+        self._admin = _AdminDashboard(
+            self._current_user,
+            terminal=self.terminal,
+            sound_player=self.sound_player,
+            store=self.config.get("store", {}),
+        )
+        self._admin.logout_requested.connect(self._on_logout)
+        self._admin.register_requested.connect(self._on_register_requested)
+        self.stack.addWidget(self._admin)
+        self.stack.setCurrentWidget(self._admin)
+        self._restart_inactivity_timer()
 
     def _auto_hold_cart(self) -> None:
         if self._cart is None or self._cart.is_empty():
@@ -468,6 +511,33 @@ def main(argv: Optional[list[str]] = None) -> int:
         log.exception("sound asset generation failed; continuing without sound")
 
     app = QApplication(sys.argv)
+    # Force Fusion style — overrides macOS native renderer so dark-mode
+    # appearance + per-system widget chrome don't override our QSS. Same
+    # rendering on Intel + Apple Silicon Macs and Windows.
+    try:
+        from PyQt6.QtWidgets import QStyleFactory
+        app.setStyle(QStyleFactory.create("Fusion"))
+    except Exception:
+        log.exception("Fusion style apply failed; falling back to default")
+    # Force light-mode palette so macOS dark mode doesn't bleed dark
+    # backgrounds into our light-themed dialogs.
+    try:
+        from PyQt6.QtGui import QColor, QPalette
+        pal = QPalette()
+        pal.setColor(QPalette.ColorRole.Window, QColor("#F4F6F9"))
+        pal.setColor(QPalette.ColorRole.Base, QColor("#FFFFFF"))
+        pal.setColor(QPalette.ColorRole.Text, QColor("#1A1A1A"))
+        pal.setColor(QPalette.ColorRole.WindowText, QColor("#1A1A1A"))
+        pal.setColor(QPalette.ColorRole.Button, QColor("#FFFFFF"))
+        pal.setColor(QPalette.ColorRole.ButtonText, QColor("#1A1A1A"))
+        pal.setColor(QPalette.ColorRole.Highlight, QColor("#2E5BA8"))
+        pal.setColor(QPalette.ColorRole.HighlightedText, QColor("#FFFFFF"))
+        pal.setColor(QPalette.ColorRole.AlternateBase, QColor("#FAFBFC"))
+        pal.setColor(QPalette.ColorRole.ToolTipBase, QColor("#FFFFFF"))
+        pal.setColor(QPalette.ColorRole.ToolTipText, QColor("#1A1A1A"))
+        app.setPalette(pal)
+    except Exception:
+        log.exception("palette apply failed")
     app.setStyleSheet(styles.get_stylesheet())
     # Touch-only deployment: auto-pop on-screen keyboard for QLineEdit focus.
     try:
