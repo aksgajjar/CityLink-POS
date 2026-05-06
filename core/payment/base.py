@@ -24,14 +24,14 @@ RESULT_ERROR = "error"
 
 # ─── Dataclasses ─────────────────────────────────────────────────────────────
 
-@dataclass(slots=True)
+@dataclass
 class PaymentRequest:
     """Sent to the terminal. amount_cents is exact (no cash rounding)."""
     amount_cents: int
     transaction_ref: str
 
 
-@dataclass(slots=True)
+@dataclass
 class PaymentResponse:
     """Returned by the terminal. `approved` is the only field callers must check."""
     approved: bool

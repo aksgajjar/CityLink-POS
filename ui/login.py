@@ -204,8 +204,8 @@ class LoginScreen(QWidget):
             Path(__file__).resolve().parent.parent / "assets" / "logo.png",
             LOGO_PATH,
         ]
-        pixmap: QPixmap | None = None
-        used_path: Path | None = None
+        pixmap: Optional[QPixmap] = None
+        used_path: Optional[Path] = None
         for p in candidate_paths:
             try:
                 if p.exists():

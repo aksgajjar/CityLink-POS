@@ -21,7 +21,7 @@ def _b(v: Any) -> bool:
 
 # ─── User ────────────────────────────────────────────────────────────────────
 
-@dataclass(slots=True)
+@dataclass
 class User:
     id: int
     name: str
@@ -52,7 +52,7 @@ class User:
 
 # ─── Item ────────────────────────────────────────────────────────────────────
 
-@dataclass(slots=True)
+@dataclass
 class Item:
     id: int
     barcode: Optional[str]
@@ -87,7 +87,7 @@ class Item:
 
 # ─── CartItem ────────────────────────────────────────────────────────────────
 
-@dataclass(slots=True)
+@dataclass
 class CartItem:
     """One line in the active cart. Mutable: qty changes, deals/tax recomputed by cart engine.
 
@@ -147,7 +147,7 @@ class CartItem:
 
 # ─── Deal ────────────────────────────────────────────────────────────────────
 
-@dataclass(slots=True)
+@dataclass
 class Deal:
     id: int
     name: str
@@ -181,7 +181,7 @@ class Deal:
 
 # ─── Transaction ─────────────────────────────────────────────────────────────
 
-@dataclass(slots=True)
+@dataclass
 class Transaction:
     """Persisted sale. Built by cart at checkout, written by db.insert_transaction."""
     transaction_ref: str
@@ -277,7 +277,7 @@ class Transaction:
 
 # ─── Shift ───────────────────────────────────────────────────────────────────
 
-@dataclass(slots=True)
+@dataclass
 class Shift:
     id: int
     cashier_id: int
