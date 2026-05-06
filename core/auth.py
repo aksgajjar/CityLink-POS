@@ -92,6 +92,10 @@ def verify_pin(pin: str) -> Optional[User]:
         log.info("login OK for %s after %d prior failures", user.name, _failed_attempts)
     _failed_attempts = 0
     _locked_until = 0.0
+    try:
+        db.set_user_last_login(user.id)
+    except Exception:
+        log.exception("could not stamp last_login for user_id=%s", user.id)
     return user
 
 

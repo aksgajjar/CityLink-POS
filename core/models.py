@@ -110,6 +110,7 @@ class CartItem:
     pst_cents: int = 0
     deposit_cents: int = 0
     line_total_cents: int = 0
+    basket_share_cents: int = 0
     kind: LineKind = "item"
 
     @classmethod

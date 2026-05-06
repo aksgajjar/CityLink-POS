@@ -16,7 +16,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -38,6 +38,7 @@ from PyQt6.QtWidgets import (
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -67,53 +68,77 @@ class InventoryScreen(QWidget):
         self.refresh()
 
     def _build_ui(self) -> None:
+        self.setObjectName("admin_inventory")
+        self.setStyleSheet(styles.admin_screen_qss())
+
         root = QVBoxLayout(self)
-        root.setContentsMargins(20, 20, 20, 20)
-        root.setSpacing(10)
+        root.setContentsMargins(24, 22, 24, 22)
+        root.setSpacing(14)
 
         # Title row
         title_row = QHBoxLayout()
-        title = QLabel("INVENTORY")
-        title.setObjectName("inventory_title")
-        f = QFont(styles.FONT_FAMILY, 22); f.setBold(True)
-        title.setFont(f)
-        title.setStyleSheet(f"color: {styles.COLORS['navy']};")
+        title = QLabel("Pricebook Management")
+        title.setObjectName("screen_title")
         title_row.addWidget(title)
         title_row.addStretch(1)
         back = QPushButton("Back")
         back.setObjectName("inventory_back")
+        back.setStyleSheet(styles.pill_button_qss("ghost"))
+        back.setMinimumHeight(40)
         back.clicked.connect(self.back_requested.emit)
         title_row.addWidget(back)
         root.addLayout(title_row)
 
-        # Toolbar
+        # Toolbar — search + dept filter + actions
         bar = QHBoxLayout()
-        bar.setSpacing(6)
+        bar.setSpacing(8)
 
         self._search = QLineEdit()
         self._search.setObjectName("inventory_search")
-        self._search.setPlaceholderText("Search by name or barcode…")
-        self._search.textChanged.connect(self._on_search_changed)
+        self._search.setProperty("touchKeyboard", "text")
+        self._search.setPlaceholderText("Search items by name or UPC…")
+        # Debounce to avoid running search_items on every keystroke (slow on
+        # large catalogs).
+        self._search_debounce = QTimer(self)
+        self._search_debounce.setSingleShot(True)
+        self._search_debounce.setInterval(180)
+        self._search_debounce.timeout.connect(self.refresh)
+        self._search.textChanged.connect(lambda _t: self._search_debounce.start())
+        self._search.returnPressed.connect(self.refresh)
         bar.addWidget(self._search, stretch=1)
 
-        for label, name, slot, color_key in [
-            ("+ Add Item",        "inv_btn_add",      self._on_add,            "btn_cash"),
-            ("Import CSV",        "inv_btn_import",   self._on_import_csv,     "btn_hold"),
-            ("Export Labels",     "inv_btn_export",   self._on_export_labels,  "btn_hold"),
-            ("Barcode Misses",    "inv_btn_misses",   self._on_misses,         "btn_lottery_p"),
+        self._dept_filter = QComboBox()
+        self._dept_filter.setObjectName("inventory_dept_filter")
+        self._dept_filter.setStyleSheet(styles.premium_combo_qss())
+        self._dept_filter.setMinimumHeight(42)
+        self._dept_filter.setMinimumWidth(180)
+        self._dept_filter.addItem("All Departments", "")
+        for d in DEPARTMENTS:
+            self._dept_filter.addItem(d["label"], d["id"])
+        self._dept_filter.currentIndexChanged.connect(lambda _i: self.refresh())
+        bar.addWidget(self._dept_filter)
+
+        for label, name, slot, variant in [
+            ("+ Add Item",      "inv_btn_add",     self._on_add,           "success"),
+            ("Import",          "inv_btn_import",  self._on_import_csv,    "ghost"),
+            ("Export Labels",   "inv_btn_export",  self._on_export_labels, "ghost"),
+            ("Barcode Misses",  "inv_btn_misses",  self._on_misses,        "ghost"),
         ]:
             b = QPushButton(label)
             b.setObjectName(name)
-            b.setMinimumHeight(40)
-            bf = QFont(styles.FONT_FAMILY, 11); bf.setBold(True)
-            b.setFont(bf)
-            color = styles.COLORS[color_key]
-            b.setStyleSheet(
-                f"QPushButton {{ background-color: {color}; color: white;"
-                f" border: none; border-radius: 6px; padding: 8px 14px; }}"
-            )
+            b.setMinimumHeight(42)
+            b.setStyleSheet(styles.pill_button_qss(variant))
             b.clicked.connect(slot)
             bar.addWidget(b)
+
+        # Multi-select placeholder (disabled until bulk-edit is built)
+        ms = QPushButton("Multi-select  ▾")
+        ms.setObjectName("inv_btn_multiselect")
+        ms.setMinimumHeight(42)
+        ms.setStyleSheet(styles.pill_button_qss("ghost"))
+        ms.setEnabled(False)
+        bar.addWidget(ms)
+
         root.addLayout(bar)
 
         # Item table
@@ -121,27 +146,33 @@ class InventoryScreen(QWidget):
         self._table.setObjectName("inventory_table")
         self._table.setColumnCount(7)
         self._table.setHorizontalHeaderLabels(
-            ["Barcode", "Name", "Dept", "Price", "GST", "PST", "Active"]
+            ["UPC / PLU", "Description", "Department", "Price", "GST", "PST", "Active"]
         )
         self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self._table.setAlternatingRowColors(True)
+        self._table.setShowGrid(False)
+        self._table.verticalHeader().setVisible(False)
+        self._table.verticalHeader().setDefaultSectionSize(38)
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self._table.horizontalHeader().setStretchLastSection(False)
+        self._table.setStyleSheet(styles.premium_table_qss())
         self._table.itemDoubleClicked.connect(lambda _it: self._on_edit_selected())
         root.addWidget(self._table, stretch=1)
 
         # Bottom action row
         action_row = QHBoxLayout()
         action_row.setSpacing(8)
-        for label, name, slot in [
-            ("Edit Selected",       "inv_btn_edit",     self._on_edit_selected),
-            ("Price History",       "inv_btn_history",  self._on_price_history),
-            ("Deactivate Selected", "inv_btn_deact",    self._on_deactivate_selected),
+        for label, name, slot, variant in [
+            ("Edit Selected",       "inv_btn_edit",     self._on_edit_selected,        "primary"),
+            ("Price History",       "inv_btn_history",  self._on_price_history,        "ghost"),
+            ("Deactivate Selected", "inv_btn_deact",    self._on_deactivate_selected,  "ghost"),
         ]:
             b = QPushButton(label)
             b.setObjectName(name)
             b.setMinimumHeight(40)
+            b.setStyleSheet(styles.pill_button_qss(variant))
             b.clicked.connect(slot)
             action_row.addWidget(b)
         action_row.addStretch(1)
@@ -150,14 +181,25 @@ class InventoryScreen(QWidget):
     # ─── Refresh / search ────────────────────────────────────────────────────
 
     def refresh(self) -> None:
-        rows = db.list_all_items(active_only=False)
-        q = self._search.text().strip().lower() if hasattr(self, "_search") else ""
+        q = self._search.text().strip() if hasattr(self, "_search") else ""
         if q:
-            rows = [
-                r for r in rows
-                if q in (r["name"] or "").lower()
-                or q in (r["barcode"] or "").lower()
-            ]
+            rows = db.search_items(q, active_only=False)
+        else:
+            rows = db.list_all_items(active_only=False)
+        # Apply department filter (no DB-level filter helper; client-side is fine
+        # for store-scale catalogs, ~thousands of items).
+        if hasattr(self, "_dept_filter"):
+            dept_id = self._dept_filter.currentData()
+            if dept_id:
+                rows = [r for r in rows if r["department"] == dept_id]
+        if not rows:
+            self._table.setRowCount(1)
+            it = QTableWidgetItem("No results")
+            it.setForeground(__import__("PyQt6.QtGui", fromlist=["QColor"]).QColor(styles.COLORS["text_muted"]))
+            self._table.setItem(0, 1, it)
+            for c in (0, 2, 3, 4, 5, 6):
+                self._table.setItem(0, c, QTableWidgetItem(""))
+            return
         self._table.setRowCount(len(rows))
         for ri, r in enumerate(rows):
             self._table.setItem(ri, 0, QTableWidgetItem(r["barcode"] or ""))
@@ -356,7 +398,8 @@ class ItemEditDialog(QDialog):
         self.setObjectName("item_edit_dialog")
         self.setWindowTitle("Add Item" if item_id is None else "Edit Item")
         self.setModal(True)
-        self.setMinimumSize(440, 480)
+        self.setMinimumSize(620, 640)
+        self.resize(640, 700)
         self._item_id = item_id
         self._admin_name = admin_name
         self._build()
@@ -364,78 +407,329 @@ class ItemEditDialog(QDialog):
             self._load_existing()
         elif prefill_barcode:
             self._barcode.setText(prefill_barcode)
+            # Scanner-flow: barcode came from register; jump cursor straight
+            # to description so cashier types item name without re-tapping.
+            self._name.setFocus()
 
     def _build(self) -> None:
-        v = QVBoxLayout(self)
-        v.setContentsMargins(16, 16, 16, 16)
-        v.setSpacing(8)
+        title_text = "Add Pricebook Item" if self._item_id is None else "Edit Pricebook Item"
 
-        title = QLabel("Item Details")
-        f = QFont(styles.FONT_FAMILY, 14); f.setBold(True)
-        title.setFont(f)
-        title.setStyleSheet(f"color: {styles.COLORS['navy']};")
-        v.addWidget(title)
+        # Premium dialog QSS + title bar styling
+        self.setStyleSheet(
+            styles.premium_dialog_qss()
+            + styles.dialog_titlebar_qss()
+            + "QLineEdit#item_barcode { font-size: 14pt; padding: 10px 12px; }"
+        )
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # ── Title bar (navy band) ──
+        title_bar = QFrame()
+        title_bar.setObjectName("dialogTitle")
+        tb_layout = QHBoxLayout(title_bar)
+        tb_layout.setContentsMargins(0, 0, 0, 0)
+        title_lbl = QLabel(title_text)
+        title_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        tb_layout.addWidget(title_lbl)
+        outer.addWidget(title_bar)
+
+        # ── Tabs ──
+        tabs = QTabWidget()
+        tabs.setObjectName("item_tabs")
+        outer.addWidget(tabs, stretch=1)
+
+        basic = self._build_basic_tab()
+        tabs.addTab(basic, "Basic Info")
+
+        # Placeholder tab — keeps door open for combo/multi-pack pricing.
+        placeholder = QWidget()
+        pv = QVBoxLayout(placeholder)
+        pv.addStretch(1)
+        ph = QLabel("Quantity / Combo pricing — coming soon.")
+        ph.setStyleSheet("color: #8A8F95; font-size: 12pt;")
+        ph.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        pv.addWidget(ph)
+        pv.addStretch(1)
+        tabs.addTab(placeholder, "Quantity Choices")
+        tabs.setTabEnabled(1, False)
+
+        # ── Status banner ──
+        self._status_banner = QLabel("")
+        self._status_banner.setObjectName("item_status_banner")
+        self._status_banner.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._status_banner.setMinimumHeight(28)
+        self._status_banner.setStyleSheet("background: transparent; padding: 0 18px;")
+        self._status_banner.hide()
+        outer.addWidget(self._status_banner)
+
+        # ── Buttons ──
+        btn_row = QHBoxLayout()
+        btn_row.setContentsMargins(18, 10, 18, 14)
+        btn_row.setSpacing(10)
+        btn_row.addStretch(1)
+        cancel = QPushButton("Cancel")
+        cancel.setObjectName("item_cancel")
+        cancel.setMinimumSize(140, 44)
+        cancel.setStyleSheet(styles.pill_button_qss("ghost"))
+        cancel.clicked.connect(self.reject)
+        btn_row.addWidget(cancel)
+        save = QPushButton("Save")
+        save.setObjectName("item_save")
+        save.setMinimumSize(160, 44)
+        save.setDefault(True)
+        save.setStyleSheet(styles.pill_button_qss("success"))
+        save.clicked.connect(self._save)
+        btn_row.addWidget(save)
+        outer.addLayout(btn_row)
+
+        # Worker thread state for UPC online lookup.
+        self._upc_thread = None
+        self._upc_worker = None
+
+        self._on_dept_change()
+        # Auto-focus: barcode for fresh entry, name when prefilled by scanner
+        # (handled in __init__).
+        self._barcode.setFocus()
+
+    def _build_basic_tab(self) -> QWidget:
+        page = QWidget()
+        page_layout = QVBoxLayout(page)
+        page_layout.setContentsMargins(18, 14, 18, 12)
+        page_layout.setSpacing(10)
+
+        card = QFrame()
+        card.setObjectName("card")
+        cv = QVBoxLayout(card)
+        cv.setContentsMargins(22, 18, 22, 18)
+        cv.setSpacing(12)
 
         form = QFormLayout()
-        form.setSpacing(8)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        form.setFormAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        form.setHorizontalSpacing(16)
+        form.setVerticalSpacing(12)
 
+        # UPC
         self._barcode = QLineEdit()
         self._barcode.setObjectName("item_barcode")
-        form.addRow("Barcode:", self._barcode)
+        self._barcode.setProperty("touchKeyboard", "num")
+        self._barcode.setPlaceholderText("Scan or type UPC, then press Enter")
+        self._barcode.returnPressed.connect(self._on_barcode_enter)
+        form.addRow(self._fl("UPC:"), self._barcode)
 
+        # Description + Size on one row
+        desc_row = QHBoxLayout()
+        desc_row.setSpacing(12)
         self._name = QLineEdit()
         self._name.setObjectName("item_name")
-        form.addRow("Name:", self._name)
+        self._name.setProperty("touchKeyboard", "text")
+        self._name.setPlaceholderText("Item description")
+        desc_row.addWidget(self._name, stretch=3)
+        size_lbl = QLabel("Size:")
+        size_lbl.setObjectName("formLabel")
+        size_lbl.setProperty("class", "formLabel")
+        desc_row.addWidget(size_lbl)
+        self._size = QLineEdit()
+        self._size.setObjectName("item_size")
+        self._size.setProperty("touchKeyboard", "text")
+        self._size.setPlaceholderText("e.g. 355ml")
+        self._size.setMaximumWidth(160)
+        desc_row.addWidget(self._size, stretch=1)
+        form.addRow(self._fl("Item Desc:"), desc_row)
 
-        self._price = QLineEdit()
-        self._price.setObjectName("item_price")
-        self._price.setPlaceholderText("Dollars (e.g. 2.49)")
-        form.addRow("Price:", self._price)
-
+        # Department
         self._dept = QComboBox()
         self._dept.setObjectName("item_dept")
+        self._dept.setStyleSheet(styles.premium_combo_qss())
+        self._dept.setMinimumHeight(40)
         for d in DEPARTMENTS:
             self._dept.addItem(d["label"], d["id"])
         self._dept.currentIndexChanged.connect(self._on_dept_change)
-        form.addRow("Department:", self._dept)
+        form.addRow(self._fl("Department:"), self._dept)
 
+        # Price
+        self._price = QLineEdit()
+        self._price.setObjectName("item_price")
+        self._price.setProperty("touchKeyboard", "num")
+        self._price.setPlaceholderText("Dollars (e.g. 2.49)")
+        self._price.returnPressed.connect(self._save)
+        form.addRow(self._fl("Price:"), self._price)
+
+        # Tax row (GST + PST inline)
+        tax_row = QHBoxLayout()
+        tax_row.setSpacing(24)
         self._gst = QCheckBox("GST taxable")
         self._gst.setObjectName("item_gst")
-        form.addRow("", self._gst)
-
+        tax_row.addWidget(self._gst)
         self._pst = QCheckBox("PST taxable")
         self._pst.setObjectName("item_pst")
-        form.addRow("", self._pst)
+        tax_row.addWidget(self._pst)
+        tax_row.addStretch(1)
+        form.addRow(self._fl("Tax:"), tax_row)
 
+        # Bottle deposit
         self._deposit = QComboBox()
         self._deposit.setObjectName("item_deposit")
+        self._deposit.setStyleSheet(styles.premium_combo_qss())
+        self._deposit.setMinimumHeight(40)
         for d in ["none", "355ml", "1L"]:
             self._deposit.addItem(d, d)
-        form.addRow("Bottle deposit:", self._deposit)
+        form.addRow(self._fl("Bottle Deposit:"), self._deposit)
 
+        # Toggle row (Age + Active)
+        toggle_row = QHBoxLayout()
+        toggle_row.setSpacing(24)
         self._age = QCheckBox("Age restricted (18+)")
         self._age.setObjectName("item_age")
-        form.addRow("", self._age)
-
+        toggle_row.addWidget(self._age)
         self._active = QCheckBox("Active")
         self._active.setObjectName("item_active")
         self._active.setChecked(True)
-        form.addRow("", self._active)
+        toggle_row.addWidget(self._active)
+        toggle_row.addStretch(1)
+        form.addRow(self._fl(""), toggle_row)
 
-        v.addLayout(form)
+        cv.addLayout(form)
+        page_layout.addWidget(card)
+        page_layout.addStretch(1)
+        return page
 
-        # Buttons
-        bb = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+    @staticmethod
+    def _fl(text: str) -> QLabel:
+        lbl = QLabel(text)
+        lbl.setObjectName("formLabel")
+        lbl.setProperty("class", "formLabel")
+        lbl.setMinimumWidth(120)
+        lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        return lbl
+
+    # ─── Status banner helpers ───────────────────────────────────────────────
+
+    def _set_banner(self, text: str, kind: str) -> None:
+        """kind: 'info' | 'ok' | 'warn' | 'err'."""
+        palette = {
+            "info": ("#E8F0FE", "#1B3A6B"),
+            "ok":   ("#E6F4EA", "#137333"),
+            "warn": ("#FEF7E0", "#B26A00"),
+            "err":  ("#FCE8E6", "#C5221F"),
+        }.get(kind, ("#EEEEEE", "#333"))
+        bg, fg = palette
+        self._status_banner.setStyleSheet(
+            f"background-color: {bg}; color: {fg};"
+            f" border-radius: 6px; padding: 4px 10px;"
         )
-        bb.button(QDialogButtonBox.StandardButton.Save).setObjectName("item_save")
-        bb.button(QDialogButtonBox.StandardButton.Cancel).setObjectName("item_cancel")
-        bb.accepted.connect(self._save)
-        bb.rejected.connect(self.reject)
-        v.addWidget(bb)
+        self._status_banner.setText(text)
+        self._status_banner.show()
 
-        # Apply default tax for the initially-selected dept
-        self._on_dept_change()
+    def _hide_banner(self) -> None:
+        self._status_banner.hide()
+        self._status_banner.setText("")
+
+    # ─── UPC autofill flow ───────────────────────────────────────────────────
+
+    def _on_barcode_enter(self) -> None:
+        bc = self._barcode.text().strip()
+        if not bc:
+            return
+        # Editing existing item — Enter on barcode is a no-op (no auto-lookup).
+        if self._item_id is not None:
+            self._price.setFocus()
+            return
+        # Step 1: local resolution (DB item OR cached UPC).
+        try:
+            from core.upc import lookup_local, auto_map_department, tax_defaults_for_dept
+            existing, cached = lookup_local(bc)
+        except Exception:
+            log.exception("lookup_local failed")
+            existing, cached = (None, None)
+        if existing is not None:
+            self._handle_existing_item(existing)
+            return
+        if cached is not None:
+            self._apply_lookup_result(cached, source_label="cache")
+            return
+        # Step 2: online lookup on a worker thread (UI stays responsive).
+        self._set_banner("⏳ Looking up UPC online…", "info")
+        self._spawn_upc_worker(bc)
+
+    def _spawn_upc_worker(self, barcode: str) -> None:
+        # Cancel previous worker if any.
+        try:
+            if self._upc_thread is not None and self._upc_thread.isRunning():
+                self._upc_thread.quit()
+                self._upc_thread.wait(500)
+        except Exception:
+            pass
+        from core.upc import UpcLookupWorker
+        from PyQt6.QtCore import QThread
+        self._upc_thread = QThread(self)
+        self._upc_worker = UpcLookupWorker(barcode)
+        self._upc_worker.moveToThread(self._upc_thread)
+        self._upc_thread.started.connect(self._upc_worker.run)
+        self._upc_worker.finished.connect(self._on_upc_finished)
+        self._upc_worker.finished.connect(self._upc_thread.quit)
+        self._upc_thread.finished.connect(self._upc_thread.deleteLater)
+        self._upc_thread.start()
+
+    def _on_upc_finished(self, barcode: str, result) -> None:
+        if result is None:
+            self._set_banner(
+                "⚠ UPC not found — enter manually",
+                "warn",
+            )
+            self._name.setFocus()
+            return
+        self._apply_lookup_result(result, source_label=getattr(result, "source", "online"))
+
+    def _apply_lookup_result(self, result, *, source_label: str = "online") -> None:
+        # Fill name only if empty (don't clobber manual input mid-typing).
+        if not self._name.text().strip():
+            label = result.name
+            if getattr(result, "brand", "") and result.brand.lower() not in label.lower():
+                label = f"{result.brand} {result.name}".strip()
+            if getattr(result, "quantity", ""):
+                label = f"{label} {result.quantity}".strip()
+            self._name.setText(label)
+        # Auto-map department from name + category hint.
+        from core.upc import auto_map_department, tax_defaults_for_dept
+        dept = auto_map_department(result.name, getattr(result, "category", ""))
+        if dept:
+            idx = self._dept.findData(dept)
+            if idx >= 0:
+                self._dept.setCurrentIndex(idx)
+                gst, pst = tax_defaults_for_dept(dept)
+                self._gst.setChecked(gst); self._pst.setChecked(pst)
+        self._set_banner(f"✓ Match found ({source_label}) — set price + Save", "ok")
+        # Hand focus to price for fast entry.
+        self._price.setFocus()
+
+    def _handle_existing_item(self, item: dict) -> None:
+        from PyQt6.QtWidgets import QMessageBox
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Icon.Question)
+        msg.setWindowTitle("Existing Item")
+        msg.setText(
+            f"Barcode already exists:\n\n"
+            f"{item['name']}  ·  ${item['price_cents']/100:.2f}\n"
+            f"Department: {item['department']}"
+        )
+        load = msg.addButton("Load Existing", QMessageBox.ButtonRole.AcceptRole)
+        new = msg.addButton("Create New (different barcode)",
+                            QMessageBox.ButtonRole.RejectRole)
+        msg.setDefaultButton(load)
+        msg.exec()
+        if msg.clickedButton() is load:
+            self._item_id = int(item["id"])
+            self.setWindowTitle("Edit Item")
+            self._load_existing()
+            self._set_banner("✓ Loaded existing item — edit and Save", "ok")
+        else:
+            # User wants different barcode — clear it for re-scan.
+            self._barcode.clear(); self._barcode.setFocus()
+            self._hide_banner()
 
     def _on_dept_change(self) -> None:
         # Pre-fill GST/PST/deposit defaults whenever dept changes (only if creating)
@@ -472,8 +766,13 @@ class ItemEditDialog(QDialog):
     def _save(self) -> None:
         name = self._name.text().strip()
         if not name:
-            QMessageBox.warning(self, "Item", "Name is required.")
+            QMessageBox.warning(self, "Item", "Description is required.")
             return
+        # Size is cosmetic — appended to name on create only (DB has no
+        # `size` column; we avoid schema churn per project rules).
+        size = self._size.text().strip() if hasattr(self, "_size") else ""
+        if size and self._item_id is None and size.lower() not in name.lower():
+            name = f"{name} {size}".strip()
         try:
             price_dollars = float(self._price.text().strip())
             if price_dollars < 0:
@@ -514,6 +813,21 @@ class ItemEditDialog(QDialog):
         except Exception as exc:
             log.exception("save item failed")
             QMessageBox.warning(self, "Item", f"Save failed: {exc}")
+
+    def closeEvent(self, ev) -> None:
+        # Cancel any in-flight UPC worker thread + close on-screen keyboard.
+        try:
+            if self._upc_thread is not None and self._upc_thread.isRunning():
+                self._upc_thread.quit()
+                self._upc_thread.wait(500)
+        except Exception:
+            pass
+        try:
+            from ui.cashier.touch_keyboard import close_active_keyboard
+            close_active_keyboard()
+        except Exception:
+            pass
+        super().closeEvent(ev)
 
 
 # ─── Price history dialog ────────────────────────────────────────────────────

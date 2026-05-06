@@ -54,11 +54,13 @@ def render_text(
         return left.ljust(avail) + right
 
     # ── Header ──
+    out.append(center("*** CITYLINK ***"))
     out.append(center(store_name.upper()))
     if store_address:
         out.append(center(store_address))
     if location_id:
         out.append(center(f"Store: {location_id}"))
+    out.append(center("(604) 000-0000"))
     out.append("")
 
     # ── Meta ──
@@ -67,6 +69,14 @@ def render_text(
     if cashier_name:
         out.append(f"Cashier: {cashier_name}")
     out.append(f"Ref:  {txn.transaction_ref}")
+    if txn.payment_method:
+        out.append(f"Pay:  {txn.payment_method.upper()}")
+    if txn.payment_method == "preview":
+        out.append(center("*** NOT A SALE — PREVIEW ***"))
+    elif (txn.total_cents or 0) < 0 or txn.payment_method == "refund":
+        out.append(center("*** REFUND ***"))
+    out.append("-" * W)
+    out.append(two_col("Item", "Total"))
     out.append("-" * W)
 
     # ── Items ──
@@ -139,6 +149,13 @@ def render_text(
     out.append("")
     out.append(center("Thank you for shopping!"))
     out.append(center(store_name))
+    out.append("")
+    out.append(center("Returns: 7 days w/ receipt"))
+    out.append(center("Original packaging required"))
+    out.append("")
+    # Promo / deals placeholder — store can customize per shift.
+    out.append(center("--- Today's Specials ---"))
+    out.append(center("Ask about our weekly deals!"))
     out.append("")
     return "\n".join(out)
 
@@ -234,7 +251,12 @@ def print_to_thermal(
         for line in text.splitlines():
             printer.text(line + "\n")
         printer.cut()
-        printer.cashdraw(2)   # kick drawer (cash sales) — harmless on others
+        # Drawer kick — CASH sales only (card / refund / preview do not open it).
+        if txn.payment_method == "cash":
+            try:
+                printer.cashdraw(2)
+            except Exception:
+                log.exception("cashdraw kick failed")
         return True
     except Exception:
         log.exception("thermal print failed")

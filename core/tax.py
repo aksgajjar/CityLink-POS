@@ -107,8 +107,10 @@ def apply_cash_rounding(total_cents: int) -> int:
 
     Rules: remainder 1-2 → round down, remainder 3-4 → round up.
     """
+    # Negative totals occur on payout / refund flows (store paying customer).
+    # Round magnitude, preserve sign.
     if total_cents < 0:
-        raise ValueError(f"total_cents must be >= 0, got {total_cents}")
+        return -apply_cash_rounding(-total_cents)
     remainder = total_cents % 5
     if remainder < 3:
         return total_cents - remainder

@@ -23,6 +23,7 @@ Manual price entry: type price on numpad, click any dept button (not ALL).
 from __future__ import annotations
 
 import time as _time
+from pathlib import Path
 from typing import Optional
 
 from PyQt6.QtCore import (
@@ -30,6 +31,7 @@ from PyQt6.QtCore import (
     QObject,
     QPropertyAnimation,
     QRect,
+    QSize,
     Qt,
     QThread,
     QTimer,
@@ -97,6 +99,19 @@ class RegisterScreen(QWidget):
         self.terminal: Optional[PaymentTerminal] = terminal
         self.sound_player = sound_player
         self._barcode_buffer = ""
+        # Tracks the most recent dept-tap-and-add so a SECOND tap on the same
+        # dept (numpad empty) acts as undo. Cleared on any other cart mutation.
+        # Format: (dept_id, line_index).
+        self._last_dept_add: Optional[tuple] = None
+        # Most recently completed transaction — used by the Reprint footer button.
+        self._last_txn: Optional[Transaction] = None
+        self._last_tid: Optional[int] = None
+        # Split payment running tally — cash portion paid before final tender.
+        # Reset on cart.clear / hold / successful finalize.
+        self._cash_partial_cents: int = 0
+        # Guards against double-tap on Cash/Card while a sale is being saved
+        # to DB or routed to the card worker. Cleared after finalize / error.
+        self._payment_locked: bool = False
 
         # Card payment state (QThread + worker held during a transaction)
         self._payment_thread: Optional[QThread] = None
@@ -137,49 +152,72 @@ class RegisterScreen(QWidget):
         bar = QFrame()
         bar.setObjectName("header")
         bar.setFixedHeight(56)
-        bar.setStyleSheet(f"background-color: {styles.COLORS['navy']}; color: white;")
+        bar.setStyleSheet(
+            f"QFrame#header {{ background-color: #1B3A6B; }}"
+            f"QFrame#header QLabel {{ color: #FFFFFF; background: transparent;"
+            f" font-weight: bold; }}"
+        )
         h = QHBoxLayout(bar)
-        h.setContentsMargins(16, 8, 16, 8)
-        h.setSpacing(16)
+        h.setContentsMargins(16, 6, 16, 6)
+        h.setSpacing(12)
 
-        title = QLabel("CITYLINK")
-        title.setObjectName("hdr_title")
-        f = QFont(styles.FONT_FAMILY, 14)
-        f.setBold(True)
-        title.setFont(f)
-        title.setStyleSheet("color: white;")
-
-        store = QLabel(self.store_name)
-        store.setObjectName("hdr_store")
-        store.setFont(QFont(styles.FONT_FAMILY, 11))
-        store.setStyleSheet("color: white;")
-
-        cashier = QLabel(f"Cashier: {self.cashier.name}")
+        # Left: cashier name (large) + clock (large).
+        cashier = QLabel(self.cashier.name)
         cashier.setObjectName("hdr_cashier")
-        cashier.setFont(QFont(styles.FONT_FAMILY, 11))
-        cashier.setStyleSheet("color: white;")
+        cf = QFont(styles.FONT_FAMILY, 14); cf.setBold(True)
+        cashier.setFont(cf)
 
         self._clock_label = QLabel("")
         self._clock_label.setObjectName("hdr_clock")
-        self._clock_label.setFont(QFont(styles.FONT_FAMILY, 11))
-        self._clock_label.setStyleSheet("color: white;")
+        kf = QFont(styles.FONT_FAMILY, 14); kf.setBold(True)
+        self._clock_label.setFont(kf)
         self._update_clock()
 
-        # Header dot reflects terminal state:
-        #   green "● TCP"    = real terminal connected
-        #   orange "● MOCK"  = mock terminal connected (test mode)
-        #   red    "● CASH-ONLY" = no terminal / disconnected
         self._terminal_dot = QLabel()
         self._terminal_dot.setObjectName("hdr_terminal_dot")
         self._terminal_dot.setFont(QFont(styles.FONT_FAMILY, 11))
         self._refresh_terminal_dot()
 
-        h.addWidget(title)
-        h.addWidget(store)
-        h.addStretch(1)
+        # Center: logo (image preferred, text fallback). Store-name removed.
+        logo_path = Path(__file__).resolve().parents[2] / "assets" / "logo.png"
+        title = QLabel()
+        title.setObjectName("hdr_title")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        if logo_path.exists():
+            from PyQt6.QtGui import QPixmap
+            pm = QPixmap(str(logo_path)).scaledToHeight(44, Qt.TransformationMode.SmoothTransformation)
+            title.setPixmap(pm)
+        else:
+            title.setText("CITYLINK")
+            tf = QFont(styles.FONT_FAMILY, 18); tf.setBold(True)
+            title.setFont(tf)
+
+        # Right: Login / Logout / LOCK — all return to PIN screen via existing
+        # logout_requested signal. (LOCK is the canonical name.)
+        def _hdr_btn(label: str, name: str) -> QPushButton:
+            b = QPushButton(label)
+            b.setObjectName(name)
+            b.setMinimumHeight(36)
+            bf = QFont(styles.FONT_FAMILY, 11); bf.setBold(True)
+            b.setFont(bf)
+            b.setStyleSheet(
+                "QPushButton { background-color: rgba(255,255,255,0.1);"
+                " color: white; border: 1px solid rgba(255,255,255,0.5);"
+                " border-radius: 4px; padding: 4px 14px; }"
+                "QPushButton:hover { background-color: rgba(255,255,255,0.25); }"
+            )
+            b.clicked.connect(self.logout_requested.emit)
+            return b
+
         h.addWidget(cashier)
         h.addWidget(self._clock_label)
         h.addWidget(self._terminal_dot)
+        h.addStretch(1)
+        h.addWidget(title)
+        h.addStretch(1)
+        h.addWidget(_hdr_btn("Login", "hdr_login"))
+        h.addWidget(_hdr_btn("Logout", "hdr_logout"))
+        h.addWidget(_hdr_btn("🔒 LOCK", "hdr_lock"))
         return bar
 
     def _build_deals_banner(self) -> QWidget:
@@ -197,6 +235,24 @@ class RegisterScreen(QWidget):
         except Exception:
             log.exception("deals banner refresh failed")
 
+    def _on_cart_inline_mutation(self, *_args) -> None:
+        """Single hook for inline cart edits (qty +/-, remove). Clears the
+        dept-toggle marker AND debounces the deals banner refresh."""
+        self._last_dept_add = None
+        self._schedule_deals_refresh()
+
+    def _schedule_deals_refresh(self) -> None:
+        """Debounce rapid cart-mutation signals into one banner refresh (80ms).
+
+        Without this, holding +/− or rapid scanner bursts hit the DB every
+        keystroke. With it, repeated signals collapse to a single delayed call.
+        """
+        if not hasattr(self, "_deals_refresh_timer") or self._deals_refresh_timer is None:
+            self._deals_refresh_timer = QTimer(self)
+            self._deals_refresh_timer.setSingleShot(True)
+            self._deals_refresh_timer.timeout.connect(self._refresh_deals_banner)
+        self._deals_refresh_timer.start(80)
+
     # ─── Left panel: cart only (Hold/Cancel live inside cart_widget now) ─────
 
     def _build_left_panel(self) -> QWidget:
@@ -204,10 +260,14 @@ class RegisterScreen(QWidget):
         self.cart_widget.setObjectName("register_cart")
         self.cart_widget.hold_clicked.connect(self._on_hold)
         self.cart_widget.cancel_clicked.connect(self._on_clear_cart)
+        self.cart_widget.print_receipt_clicked.connect(self._on_print_button)
         self.cart_widget.restore_held_requested.connect(self._on_restore_held)
-        # Refresh deals banner whenever the cart changes via inline controls
-        self.cart_widget.qty_changed.connect(lambda _n: self._refresh_deals_banner())
-        self.cart_widget.item_removed.connect(self._refresh_deals_banner)
+        # Refresh deals banner whenever the cart changes via inline controls.
+        # Debounced — under fast +/- or scanner burst, collapses to one DB hit.
+        # Also clears _last_dept_add so dept-tap-undo only works as the *next*
+        # action after a dept-add (not after the user fiddled with the cart).
+        self.cart_widget.qty_changed.connect(self._on_cart_inline_mutation)
+        self.cart_widget.item_removed.connect(self._on_cart_inline_mutation)
         # Sync HELD pill with DB on load
         self._refresh_held_count()
         # Initial deals-banner population (deferred until banner exists)
@@ -269,23 +329,29 @@ class RegisterScreen(QWidget):
         v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(0)
 
+        # Numpad buffer + display — display is mounted inside the search bar row.
+        self._numpad_buffer: str = ""
+        self._numpad_display = QLabel("ENTERED: $0.00")
+        self._numpad_display.setObjectName("numpad_display")
+        self._numpad_display.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        df = QFont(styles.FONT_FAMILY, 24); df.setBold(True)
+        self._numpad_display.setFont(df)
+        self._numpad_display.setMinimumHeight(44)
+        self._numpad_display.setStyleSheet(
+            f"QLabel#numpad_display {{ color: #1B3A6B; background: white;"
+            f" padding: 4px 16px; border: 2px solid #1B3A6B;"
+            f" border-radius: 6px; }}"
+        )
+
         v.addWidget(self._build_tabs_bar())
+        # Dept tiles + per-dept quick-button area (combined widget).
         v.addWidget(self._build_dept_tiles())
         v.addWidget(self._build_separator())
         v.addWidget(self._build_search_bar())
 
-        # NRS numpad+action grid
-        self._numpad_buffer: str = ""
-        # Hidden display label (kept for backward compat with _numpad_render());
-        # not added to layout — amount visibility relies on cart TOTAL panel.
-        self._numpad_display = QLabel("$0.00")
-        self._numpad_display.setObjectName("numpad_display")
-        self._numpad_display.hide()
-
-        v.addWidget(self._build_numpad_grid())
-        sec = self._build_sec_rows()
-        sec.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        v.addWidget(sec, stretch=1)   # absorbs leftover vertical space, white bg fills gap
+        # Numpad gets the leftover stretch so digits + Cash button grow with screen.
+        v.addWidget(self._build_numpad_grid(), stretch=1)
+        v.addWidget(self._build_sec_rows())
         v.addWidget(self._build_info_bar())
         return panel
 
@@ -296,27 +362,20 @@ class RegisterScreen(QWidget):
         container.setObjectName("sec_rows_container")
         container.setStyleSheet("QFrame#sec_rows_container { background-color: white; }")
         v = QVBoxLayout(container)
-        v.setSpacing(3)
-        v.setContentsMargins(2, 4, 2, 2)
-
-        # Row A: Cancel Item / No Sale / Override Price
-        # (Hold + Retrieve dropped — Hold is inside cart panel, Retrieve via HELD pill)
+        v.setSpacing(2)
+        v.setContentsMargins(2, 2, 2, 2)
+        # Single compact row — frees ~50px of vertical space for the numpad.
         h1 = QHBoxLayout(); h1.setSpacing(3)
         for label, name, color_key, slot in [
             ("Cancel Item",    "act_cancel_item",    "btn_cancel",  self._on_cancel_item),
             ("No Sale",        "act_no_sale",        "btn_no_sale", self._on_no_sale),
             ("Override Price", "act_override_price", "btn_void",    self._on_override_price),
+            ("Price Check",    "act_price_check",    "btn_hold",    self._on_price_check),
         ]:
-            b = self._mk_action(label, name, color_key, height=40)
+            b = self._mk_action(label, name, color_key, height=42)
             b.clicked.connect(slot)
             h1.addWidget(b)
         v.addLayout(h1)
-
-        # Row C: Price Check full width
-        pc = self._mk_action("Price Check", "act_price_check", "btn_hold", height=40)
-        pc.clicked.connect(self._on_price_check)
-        v.addWidget(pc)
-
         return container
 
     # ─── Top tabs ────────────────────────────────────────────────────────────
@@ -335,7 +394,7 @@ class RegisterScreen(QWidget):
         active = QPushButton("Departments")
         active.setObjectName("tab_departments")
         active.setStyleSheet(
-            "QPushButton { background-color: #B8C5D6; color: #1B3A6B;"
+            "QPushButton { background-color: #F1C40F; color: #1B3A6B;"
             " border: none; border-radius: 16px; padding: 6px 24px;"
             " font-weight: bold; font-size: 11pt; }"
         )
@@ -359,39 +418,95 @@ class RegisterScreen(QWidget):
     # ─── Dept tile grid (NRS) ────────────────────────────────────────────────
 
     def _build_dept_tiles(self) -> QWidget:
-        container = QFrame()
-        container.setObjectName("dept_tiles")
-        # Light grey background distinguishes dept area from white numpad area
-        container.setStyleSheet("QFrame#dept_tiles { background-color: #E8E8E8; }")
-        grid = QGridLayout(container)
-        grid.setSpacing(8)
-        grid.setContentsMargins(8, 4, 8, 8)
-        for c in range(6):
-            grid.setColumnStretch(c, 1)
+        """Editable 3×3 dept tile grid. Admin can add/edit/delete; max 9 slots."""
+        from ui.cashier.dept_tiles import DeptTileGrid
+        is_admin = (getattr(self.cashier, "role", "") == "admin")
+        self._dept_grid = DeptTileGrid(admin_mode=is_admin)
+        self._dept_grid.dept_clicked.connect(self._on_dept_tile_click)
+        self._dept_grid.add_requested.connect(self._on_dept_tile_add)
+        self._dept_grid.edit_requested.connect(self._on_dept_tile_edit)
+        self._dept_grid.quick_add_requested.connect(self._on_quick_sell)
+        return self._dept_grid
 
-        for i, (label, color, dept_id) in enumerate(self.NRS_DEPT_TILES):
-            r, c = divmod(i, 6)
-            b = QPushButton(label)
-            b.setObjectName(f"nrs_dept_{i}")
-            b.setMinimumHeight(52)
-            b.setMaximumHeight(52)
-            b.setStyleSheet(
-                f"QPushButton {{ background-color: {color}; color: white;"
-                f" border: 1px solid #888; border-radius: 4px;"
-                f" font-weight: bold; font-size: 10pt; padding: 4px; }}"
+    def _on_dept_tile_click(self, dept_id: str) -> None:
+        """Tile click → existing typed-price + tap manual-add workflow."""
+        if not dept_id:
+            return
+        if self._numpad_cents() > 0:
+            self._on_dept_selected(dept_id)
+
+    def _require_admin_pin(self) -> bool:
+        """Prompt for admin PIN; return True iff verified admin."""
+        if getattr(self.cashier, "role", "") == "admin":
+            return True
+        from PyQt6.QtWidgets import QInputDialog
+        pin, ok = QInputDialog.getText(
+            self, "Admin PIN", "Enter admin PIN:",
+            echo=QLineEdit.EchoMode.Password,
+        )
+        if not ok or not pin:
+            return False
+        try:
+            user = db.get_user_by_pin(pin)
+        except Exception:
+            log.exception("get_user_by_pin failed")
+            user = None
+        if user is None or user.get("role") != "admin":
+            self._error("Invalid admin PIN.")
+            return False
+        return True
+
+    def _on_dept_tile_add(self) -> None:
+        if not self._require_admin_pin():
+            return
+        from ui.cashier.dept_tiles import DeptTileEditDialog
+        dlg = DeptTileEditDialog(parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted or dlg.result_data is None:
+            return
+        try:
+            db.create_dept_tile(
+                name=dlg.result_data["name"],
+                color=dlg.result_data["color"],
+                dept_id="",
+                price_cents=int(dlg.result_data.get("price_cents", 0)),
+                taxable=bool(dlg.result_data.get("taxable", True)),
             )
-            if dept_id is not None:
-                b.clicked.connect(lambda _ck=False, x=dept_id: self._on_dept_selected(x))
-            else:
-                b.clicked.connect(lambda _ck=False, x=label: self._stub(f"{x} (NRS-only dept, not configured)"))
-            grid.addWidget(b, r, c)
+        except Exception:
+            log.exception("create_dept_tile failed")
+            self._error("Could not save tile.")
+            return
+        self._dept_grid.refresh()
 
-        # Empty cells fill row 2 to slot 11
-        for slot in range(len(self.NRS_DEPT_TILES), 12):
-            r, c = divmod(slot, 6)
-            grid.addWidget(self._empty_tile(52, bg="#E8E8E8"), r, c)
-
-        return container
+    def _on_dept_tile_edit(self, tile_id: int) -> None:
+        if not self._require_admin_pin():
+            return
+        from ui.cashier.dept_tiles import DeptTileEditDialog
+        try:
+            tiles = db.list_dept_tiles()
+        except Exception:
+            log.exception("list_dept_tiles failed"); return
+        existing = next((t for t in tiles if int(t["id"]) == tile_id), None)
+        if existing is None:
+            return
+        dlg = DeptTileEditDialog(tile_id=tile_id, existing=existing, parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            if dlg.deleted:
+                db.delete_dept_tile(tile_id)
+            elif dlg.result_data is not None:
+                db.update_dept_tile(
+                    tile_id,
+                    name=dlg.result_data["name"],
+                    color=dlg.result_data["color"],
+                    price_cents=int(dlg.result_data.get("price_cents", 0)),
+                    taxable=bool(dlg.result_data.get("taxable", True)),
+                )
+        except Exception:
+            log.exception("dept_tile save failed")
+            self._error("Save failed.")
+            return
+        self._dept_grid.refresh()
 
     def _empty_tile(self, height: int, *, bg: str = "white") -> QWidget:
         w = QWidget()
@@ -416,10 +531,14 @@ class RegisterScreen(QWidget):
         container.setObjectName("numpad_grid_container")
         container.setStyleSheet("QFrame#numpad_grid_container { background-color: white; }")
         grid = QGridLayout(container)
-        grid.setSpacing(2)
-        grid.setContentsMargins(2, 2, 2, 2)
+        grid.setSpacing(4)
+        grid.setContentsMargins(4, 4, 4, 4)
         for c in range(6):
             grid.setColumnStretch(c, 1)
+        # All 4 rows distribute height EQUALLY — keeps every cell same size
+        # so the keypad reads as a square cluster, not stretched columns.
+        for r in range(4):
+            grid.setRowStretch(r, 1)
 
         DIGIT_QSS = (
             "QPushButton { background-color: white; color: #333;"
@@ -430,67 +549,69 @@ class RegisterScreen(QWidget):
         def mk_digit(text: str, name: str) -> QPushButton:
             b = QPushButton(text)
             b.setObjectName(name)
-            b.setMinimumHeight(46); b.setMaximumHeight(46)
+            b.setMinimumHeight(54)   # min — grid row stretch grows it equally
+            b.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
             b.setStyleSheet(DIGIT_QSS)
             return b
 
         def mk_act(text: str, name: str, color: str, *, font_pt: int = 11) -> QPushButton:
             b = QPushButton(text)
             b.setObjectName(name)
-            b.setMinimumHeight(46); b.setMaximumHeight(46)
+            b.setMinimumHeight(54)
+            b.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
             b.setStyleSheet(
                 f"QPushButton {{ background-color: {color}; color: white;"
                 f" border: none; font-weight: bold; font-size: {font_pt}pt; }}"
             )
             return b
 
-        # ─ Row 0: 7 8 9 | LOTTERY PAYOUT (green) | $20 (orange) | $10 (orange) ─
-        for i, d in enumerate(["7", "8", "9"]):
-            b = mk_digit(d, f"npd_btn_{d}")
-            b.clicked.connect(lambda _ck=False, x=d: self._numpad_input(x))
-            grid.addWidget(b, 0, i)
-        b = mk_act("LOTTERY\nPAYOUT", "act_lottery_minus", "#4CAF50", font_pt=10)
+        # NRS-style 6-col layout (matches reference screenshot):
+        # Row 0: 7 | 8 | 9 | LOTTERY PAYOUT | $20 (orange) | $10 (orange)
+        # Row 1: 4 | 5 | 6 | $5 (orange)    | -            | Basket Discount (blue)
+        # Row 2: 1 | 2 | 3 | Credit/Debit (red) | -        | CASH (green, span rows 2-3)
+        # Row 3: 0 | 00| ⌫ | Refund (red)   | -            | (CASH cont)
+        digit_layout = [
+            (0, ["7", "8", "9"]),
+            (1, ["4", "5", "6"]),
+            (2, ["1", "2", "3"]),
+            (3, ["0", "00", "BACK"]),
+        ]
+        for r, row in digit_layout:
+            for ci, d in enumerate(row):
+                if d == "BACK":
+                    b = mk_digit("⌫", "npd_btn_back")
+                    b.clicked.connect(lambda _ck=False: self._numpad_back())
+                else:
+                    b = mk_digit(d, f"npd_btn_{d}")
+                    b.clicked.connect(lambda _ck=False, x=d: self._numpad_input(x))
+                grid.addWidget(b, r, ci)
+
+        # ── Right action cluster (cols 3-5) ──
+        b = mk_act("LOTTERY\nPAYOUT", "act_lottery_minus", "#4CAF50", font_pt=13)
         b.clicked.connect(self._on_lottery_minus); grid.addWidget(b, 0, 3)
+
         b = mk_act("$20", "act_cash_20", "#F39C12", font_pt=14)
         b.clicked.connect(lambda: self._on_cash_shortcut(2000)); grid.addWidget(b, 0, 4)
         b = mk_act("$10", "act_cash_10", "#F39C12", font_pt=14)
         b.clicked.connect(lambda: self._on_cash_shortcut(1000)); grid.addWidget(b, 0, 5)
 
-        # ─ Row 1: 4 5 6 | $5 (orange) | empty | Basket Discount (blue) ─
-        for i, d in enumerate(["4", "5", "6"]):
-            b = mk_digit(d, f"npd_btn_{d}")
-            b.clicked.connect(lambda _ck=False, x=d: self._numpad_input(x))
-            grid.addWidget(b, 1, i)
         b = mk_act("$5", "act_cash_5", "#F39C12", font_pt=14)
         b.clicked.connect(lambda: self._on_cash_shortcut(500)); grid.addWidget(b, 1, 3)
         grid.addWidget(self._empty_tile(46), 1, 4)
-        b = mk_act("Basket\nDiscount", "act_basket_discount", "#2196F3", font_pt=10)
-        b.clicked.connect(lambda: self._stub("Basket Discount"))
-        grid.addWidget(b, 1, 5)
+        b = mk_act("Basket\nDiscount", "act_basket_discount", "#2196F3", font_pt=11)
+        b.clicked.connect(self._on_basket_discount); grid.addWidget(b, 1, 5)
 
-        # ─ Row 2: 1 2 3 | Credit Debit (red) | empty | Cash (green) ─
-        for i, d in enumerate(["1", "2", "3"]):
-            b = mk_digit(d, f"npd_btn_{d}")
-            b.clicked.connect(lambda _ck=False, x=d: self._numpad_input(x))
-            grid.addWidget(b, 2, i)
-        b = mk_act("Credit\nDebit", "act_card", "#E53935", font_pt=11)
+        b = mk_act("Credit\nDebit", "act_card", "#E53935", font_pt=13)
         b.clicked.connect(self._on_card); grid.addWidget(b, 2, 3)
         grid.addWidget(self._empty_tile(46), 2, 4)
-        b = mk_act("Cash", "act_cash", "#4CAF50", font_pt=14)
-        b.clicked.connect(self._on_cash); grid.addWidget(b, 2, 5)
+        cash_btn = mk_act("CASH", "act_cash", "#27AE60", font_pt=20)
+        cash_btn.clicked.connect(self._on_cash)
+        grid.addWidget(cash_btn, 2, 5, 2, 1)
 
-        # ─ Row 3: 0 00 @ | empty | Refund (red) | empty ─
-        b = mk_digit("0", "npd_btn_0")
-        b.clicked.connect(lambda _ck=False: self._numpad_input("0")); grid.addWidget(b, 3, 0)
-        b = mk_digit("00", "npd_btn_00")
-        b.clicked.connect(lambda _ck=False: self._numpad_input("00")); grid.addWidget(b, 3, 1)
-        at_btn = mk_digit("@", "npd_btn_at")
-        grid.addWidget(at_btn, 3, 2)
-        grid.addWidget(self._empty_tile(46), 3, 3)
-        b = mk_act("Refund", "act_refund", "#E53935", font_pt=12)
-        b.clicked.connect(lambda: self._stub("Refund"))
-        grid.addWidget(b, 3, 4)
-        grid.addWidget(self._empty_tile(46), 3, 5)
+        b = mk_act("Refund", "act_refund", "#E53935", font_pt=11)
+        b.setToolTip("Refund (manager PIN required). Enter amount on numpad first.")
+        b.clicked.connect(self._on_refund); grid.addWidget(b, 3, 3)
+        grid.addWidget(self._empty_tile(46), 3, 4)
 
         return container
 
@@ -499,7 +620,7 @@ class RegisterScreen(QWidget):
     def _build_info_bar(self) -> QWidget:
         bar = QFrame()
         bar.setObjectName("info_bar")
-        bar.setFixedHeight(28)
+        bar.setFixedHeight(20)
         bar.setStyleSheet("QFrame#info_bar { background-color: #555; }")
         h = QHBoxLayout(bar)
         h.setContentsMargins(12, 4, 12, 4)
@@ -515,11 +636,18 @@ class RegisterScreen(QWidget):
     def _build_search_bar(self) -> QWidget:
         bar = QFrame()
         bar.setObjectName("search_bar")
-        bar.setFixedHeight(50)
-        bar.setStyleSheet("QFrame#search_bar { background-color: #DCDCDC; }")
+        bar.setFixedHeight(60)
+        bar.setStyleSheet(
+            "QFrame#search_bar { background-color: #1B3A6B;"
+            " border-top: 2px solid #F1C40F;"
+            " border-bottom: 2px solid #F1C40F; }"
+        )
         h = QHBoxLayout(bar)
-        h.setContentsMargins(8, 6, 8, 6)
+        h.setContentsMargins(8, 8, 8, 8)
         h.setSpacing(8)
+
+        # ENTERED display moved to LEFT (priority for cashier glance).
+        h.addWidget(self._numpad_display)
 
         # X clear (grey circle with white X)
         self._search_clear_btn = QPushButton("✕")
@@ -537,7 +665,10 @@ class RegisterScreen(QWidget):
         # White rounded input area with magnifier prefix
         input_wrap = QFrame()
         input_wrap.setObjectName("search_input_wrap")
-        input_wrap.setStyleSheet("QFrame#search_input_wrap { background-color: white; }")
+        input_wrap.setStyleSheet(
+            "QFrame#search_input_wrap { background-color: white;"
+            " border: 2px solid #F1C40F; border-radius: 6px; }"
+        )
         iw = QHBoxLayout(input_wrap)
         iw.setContentsMargins(6, 0, 6, 0)
         iw.setSpacing(6)
@@ -554,10 +685,13 @@ class RegisterScreen(QWidget):
 
         self._search_input = QLineEdit()
         self._search_input.setObjectName("search_input")
-        self._search_input.setPlaceholderText("")
+        self._search_input.setPlaceholderText("Scan barcode or enter SKU")
+        # Force compact text-keyboard popup (not the numeric variant).
+        self._search_input.setProperty("touchKeyboard", "text")
         self._search_input.setStyleSheet(
             "QLineEdit { background: transparent; border: none;"
-            " font-size: 13pt; color: #333; padding: 4px; }"
+            " font-size: 16pt; color: #333; padding: 4px; }"
+            "QLineEdit::placeholder { color: #888; }"
         )
         self._search_input.returnPressed.connect(self._on_search_submit)
         iw.addWidget(self._search_input, stretch=1)
@@ -590,16 +724,50 @@ class RegisterScreen(QWidget):
         return bar
 
     def _on_search_clear(self) -> None:
+        # X clears BOTH the search box and the ENTERED amount buffer.
+        # Closes any open touch keyboard and drops focus from the search input.
         self._search_input.clear()
-        self._search_input.setFocus()
+        self._numpad_clear()
+        self._search_input.clearFocus()
+        try:
+            from ui.cashier.touch_keyboard import close_active_keyboard
+            close_active_keyboard()
+        except Exception:
+            log.exception("close_active_keyboard failed")
 
     def _on_search_submit(self) -> None:
         text = self._search_input.text().strip()
         if not text:
             return
-        # Treat anything submitted via Enter as a barcode for now.
-        # Future: distinguish numeric (barcode) from text (name search).
-        self._handle_barcode(text)
+        # Try exact barcode match first.
+        row = db.get_item_by_barcode(text)
+        if row is not None:
+            from core.models import Item
+            ln = self.cart.add_item(Item.from_row(row))
+            idx = self.cart.lines.index(ln)
+            self.cart_widget.refresh(flash_index=idx)
+            self._refresh_deals_banner()
+            self._search_input.clear()
+            return
+        # Fallback: partial name/barcode search → picker dialog.
+        try:
+            results = db.search_items(text, active_only=True, limit=50)
+        except Exception:
+            log.exception("search_items failed")
+            results = []
+        if not results:
+            self._info(f"No results for '{text}'.")
+            self._search_input.clear()
+            return
+        dlg = ItemPickerDialog(results, parent=self, initial_query=text)
+        if dlg.exec() != QDialog.DialogCode.Accepted or dlg.picked is None:
+            self._search_input.clear()
+            return
+        from core.models import Item
+        ln = self.cart.add_item(Item.from_row(dlg.picked))
+        idx = self.cart.lines.index(ln)
+        self.cart_widget.refresh(flash_index=idx)
+        self._refresh_deals_banner()
         self._search_input.clear()
 
     def _on_search_back(self) -> None:
@@ -684,7 +852,7 @@ class RegisterScreen(QWidget):
 
     def _numpad_render(self) -> None:
         cents = int(self._numpad_buffer) if self._numpad_buffer.isdigit() else 0
-        self._numpad_display.setText(f"${cents / 100:.2f}")
+        self._numpad_display.setText(f"ENTERED: ${cents / 100:.2f}")
 
     def _numpad_cents(self) -> int:
         return int(self._numpad_buffer) if self._numpad_buffer.isdigit() else 0
@@ -715,7 +883,7 @@ class RegisterScreen(QWidget):
             ("≡ Menu",     "ftr_menu",     lambda: self._stub("Menu")),
             ("Calculator", "ftr_calc",     lambda: self._stub("Calculator")),
             ("Receipts",   "ftr_receipts", lambda: self._stub("Receipts")),
-            ("Reprint",    "ftr_reprint",  lambda: self._stub("Reprint")),
+            ("Reprint",    "ftr_reprint",  self._on_reprint_last),
             ("EOD",        "ftr_eod",      self._on_eod),
         ]:
             b = mk_footer(label, name)
@@ -755,6 +923,28 @@ class RegisterScreen(QWidget):
         if self.sound_player is not None:
             self.sound_player.play_success()
 
+    def _play_chaching(self) -> None:
+        # Prefer the production MP3 cash-register clip when present; fall
+        # back to the legacy synthesized cha-ching WAV otherwise.
+        if self.sound_player is None:
+            return
+        try:
+            if self.sound_player._mp3.get("cash") is not None:
+                self.sound_player.play_cash_sound()
+                return
+        except Exception:
+            pass
+        self.sound_player.play_chaching()
+
+    def _play_card_approved(self) -> None:
+        """Play CardPayment.mp3 on card approval completion. Failsafe."""
+        if self.sound_player is None:
+            return
+        try:
+            self.sound_player.play_card_sound()
+        except Exception:
+            pass
+
     def _play_error(self) -> None:
         if self.sound_player is not None:
             self.sound_player.play_error()
@@ -793,16 +983,177 @@ class RegisterScreen(QWidget):
             return
         super().keyPressEvent(ev)
 
+    def _on_basket_discount(self) -> None:
+        """Apply a cart-level discount (% or flat $). Reflected in GST/PST."""
+        if self.cart.is_empty():
+            self._info("Cart is empty.")
+            return
+        from PyQt6.QtWidgets import QInputDialog
+        # Choose mode: percent OR amount.
+        mode, ok = QInputDialog.getItem(
+            self, "Basket Discount", "Discount type:",
+            ["Percent (%)", "Amount ($)"], 0, False,
+        )
+        if not ok:
+            return
+        if mode.startswith("Percent"):
+            pct, ok = QInputDialog.getDouble(
+                self, "Basket Discount", "Percent off subtotal:",
+                10.0, 0.0, 100.0, 1,
+            )
+            if not ok:
+                return
+            self.cart.set_basket_discount(pct=pct)
+        else:
+            dollars, ok = QInputDialog.getDouble(
+                self, "Basket Discount", "Amount off ($):",
+                1.00, 0.0, 9999.0, 2,
+            )
+            if not ok:
+                return
+            self.cart.set_basket_discount(cents=int(round(dollars * 100)))
+        self.cart_widget.refresh()
+        self._refresh_deals_banner()
+
+    def _on_refund(self) -> None:
+        """Refund flow: numpad cents → manager PIN → record neg txn → print."""
+        cents = self._numpad_cents()
+        if cents <= 0:
+            self._error("Enter refund amount on the numpad first.")
+            return
+        if not self._confirm(f"Refund ${cents/100:.2f} to customer?"):
+            return
+        # Manager PIN required.
+        from PyQt6.QtWidgets import QInputDialog
+        pin, ok = QInputDialog.getText(
+            self, "Manager PIN", "Enter manager PIN:",
+            echo=QInputDialog.EchoMode.Password.value if hasattr(QInputDialog, 'EchoMode') else 2,
+        )
+        if not ok or not pin:
+            return
+        try:
+            user = db.get_user_by_pin(pin)
+        except Exception:
+            log.exception("verify_pin failed")
+            user = None
+        if user is None or user.get("role") != "admin":
+            self._error("Invalid manager PIN.")
+            return
+        # Record refund as a negative-amount transaction with payment_method='refund'.
+        ref = db.next_transaction_ref()
+        try:
+            tid = db.insert_transaction({
+                "transaction_ref": ref,
+                "subtotal_cents": -cents, "discount_cents": 0,
+                "gst_cents": 0, "pst_cents": 0,
+                "deposit_cents": 0, "bag_charge_cents": 0,
+                "total_cents": -cents, "rounded_total_cents": -cents,
+                "payment_method": "refund",
+                "cash_tendered_cents": 0, "change_cents": 0,
+                "card_amount_cents": 0,
+                "card_auth_code": None, "card_last4": None,
+                "status": "refunded",
+                "cashier_id": self.cashier.id,
+                "cashier_name": self.cashier.name,
+                "shift_id": self.shift_id,
+            }, items=[])
+        except Exception:
+            log.exception("refund insert failed")
+            self._error("Failed to save refund. See errors.log.")
+            return
+        # Print refund slip (re-uses receipt path with negative txn).
+        try:
+            from core.models import Transaction
+            txn = Transaction(
+                transaction_ref=ref,
+                subtotal_cents=-cents, discount_cents=0,
+                gst_cents=0, pst_cents=0, deposit_cents=0, bag_charge_cents=0,
+                total_cents=-cents, rounded_total_cents=-cents,
+                payment_method="refund",
+                cash_tendered_cents=0, change_cents=0,
+                cashier_id=self.cashier.id, cashier_name=self.cashier.name,
+                shift_id=self.shift_id, items=[],
+            )
+            self._print_receipt(txn, tid)
+        except Exception:
+            log.exception("refund receipt print failed")
+        self._open_cash_drawer()
+        self._numpad_clear()
+        self._info(f"Refund ${cents/100:.2f} approved by {user['name']}.\nRef: {ref}")
+
+    def _on_quick_sell(self, name: str, price_cents: int, taxable: bool) -> None:
+        """Quick-sell tile click → add manual line, no numpad needed."""
+        if price_cents < 0:
+            return
+        # Map taxable flag to a dept that matches BC tax defaults so existing
+        # line-tax logic stays intact:
+        dept = "snacks" if taxable else "gift_cards"
+        try:
+            ln = self.cart.add_manual(
+                name=name, unit_price_cents=price_cents,
+                department=dept, quantity=1,
+            )
+        except Exception:
+            log.exception("quick-sell add failed")
+            self._error("Could not add quick-sell item.")
+            return
+        idx = self.cart.lines.index(ln)
+        self.cart_widget.refresh(flash_index=idx)
+        self._refresh_deals_banner()
+
+    def _on_unknown_barcode(self, barcode: str) -> None:
+        """Cashier-side missing-item flow: prompt to Add or Cancel.
+        On Add → reuse admin's ItemEditDialog with prefilled barcode; on save
+        the new item is auto-added to the current cart.
+        """
+        from PyQt6.QtWidgets import QMessageBox
+        try:
+            db.log_barcode_miss(barcode)
+        except Exception:
+            log.exception("log_barcode_miss failed")
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Icon.Question)
+        msg.setWindowTitle("Item not found")
+        msg.setText(f"Barcode {barcode} not found.\n\nAdd it to inventory?")
+        add_btn = msg.addButton("Add Item", QMessageBox.ButtonRole.AcceptRole)
+        cancel_btn = msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        msg.setDefaultButton(add_btn)
+        msg.exec()
+        if msg.clickedButton() is not add_btn:
+            return
+        from ui.admin.inventory import ItemEditDialog
+        dlg = ItemEditDialog(item_id=None, prefill_barcode=barcode,
+                             admin_name=self.cashier.name, parent=self)
+        # Description focus is set inside ItemEditDialog when prefill_barcode
+        # is provided (scanner-flow). Cashier types name → tabs to price → Save.
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        # Re-fetch the freshly-saved item by barcode and add to cart.
+        try:
+            row = db.get_item_by_barcode(barcode)
+        except Exception:
+            log.exception("post-add lookup failed")
+            row = None
+        if row is None:
+            self._error("Item saved but lookup failed. Re-scan to add.")
+            return
+        from core.models import Item
+        ln = self.cart.add_item(Item.from_row(row))
+        idx = self.cart.lines.index(ln)
+        self.cart_widget.refresh(flash_index=idx)
+        self._refresh_deals_banner()
+
     def _handle_barcode(self, barcode: str) -> None:
         log.info("scan: %s", barcode)
+        self._last_dept_add = None
         if hasattr(self, "_search_input") and self._search_input is not None:
             self._search_input.setText(barcode)
             QTimer.singleShot(1500, lambda: self._search_input.clear()
                               if self._search_input.text() == barcode else None)
         row = db.get_item_by_barcode(barcode)
         if row is None:
-            db.log_barcode_miss(barcode)
-            self._info(f"Unknown barcode: {barcode}\nAdmin → Inventory to add it.")
+            # New flow: offer to add the item right now (cashier-side quick add).
+            self._on_unknown_barcode(barcode)
             return
         from core.models import Item
         ln = self.cart.add_item(Item.from_row(row))
@@ -813,19 +1164,21 @@ class RegisterScreen(QWidget):
     # ─── department / manual entry ───────────────────────────────────────────
 
     def _on_dept_selected(self, dept_id: str) -> None:
-        # Numpad has price → dept click adds manual line in that dept.
-        # Otherwise (numpad empty) selection is a no-op (browse hook for later).
+        # Numpad buffer = manual price for this dept. Empty buffer → no-op
+        # (cashier needs to type a price first).
         if dept_id == ALL_ID:
-            return
-        cents = self._numpad_cents()
-        if cents <= 0:
             return
         d = DEPT_BY_ID.get(dept_id)
         if d is None:
             self._error(f"Unknown department: {dept_id}")
             return
-        ln = self.cart.add_manual(name=d["label"], unit_price_cents=cents, department=dept_id, quantity=1)
+        cents = self._numpad_cents()
+        if cents <= 0:
+            return
+        ln = self.cart.add_manual(name=d["label"], unit_price_cents=cents,
+                                  department=dept_id, quantity=1)
         idx = self.cart.lines.index(ln)
+        self._last_dept_add = (dept_id, idx)
         self.cart_widget.refresh(flash_index=idx)
         self._numpad_clear()
         self._refresh_deals_banner()
@@ -839,19 +1192,52 @@ class RegisterScreen(QWidget):
             self._numpad_input(ch)
 
     def _on_cash(self) -> None:
+        """Cash press supports SPLIT payments.
+
+        Buffer empty + no prior partials → exact payment.
+        Buffer < remaining → partial: accumulate, transaction stays open.
+        Buffer >= remaining → finalize (cash-only or split if prior partials).
+        """
+        self._last_dept_add = None
+        if self._payment_locked:
+            log.info("cash press ignored — payment in progress")
+            return
         if self.cart.is_empty():
             self._info("Cart is empty.")
             return
         rounded = self.cart.totals["rounded_total_cents"]
-        tender = self._numpad_cents()
-        if tender == 0:
-            tender = rounded   # exact change shortcut
-        if tender < rounded:
-            short = rounded - tender
-            self._error(f"Insufficient cash: short ${short / 100:.2f}")
+        partial = self._cash_partial_cents
+        remaining = rounded - partial
+        if remaining <= 0:
+            self._info("Already paid in full. Press Cancel to clear or scan next sale.")
             return
-        change = tender - rounded
-        self._finalize_cash(tender, change)
+        raw = self._numpad_cents()
+        if raw == 0:
+            # Empty buffer → tender exactly the remaining amount (no change).
+            self._payment_locked = True
+            try:
+                tender_total = partial + remaining
+                self._cash_partial_cents = 0
+                self._finalize_cash(tender_total, 0)
+            finally:
+                self._payment_locked = False
+            return
+        if raw < remaining:
+            # Partial cash payment — accumulate silently. No popup.
+            # Cart's total band shows remaining via update_partial_paid.
+            self._cash_partial_cents += raw
+            self._numpad_clear()
+            self.cart_widget.totals_panel.set_partial_paid(self._cash_partial_cents)
+            return
+        # Full or over — finalize with combined tender. Lock to block re-entry.
+        self._payment_locked = True
+        try:
+            change = raw - remaining
+            tender_total = partial + raw
+            self._cash_partial_cents = 0
+            self._finalize_cash(tender_total, change)
+        finally:
+            self._payment_locked = False
 
     def _finalize_cash(self, tender_cents: int, change_cents: int) -> None:
         t = self.cart.totals
@@ -875,39 +1261,128 @@ class RegisterScreen(QWidget):
             items=list(self.cart.lines),
         )
         items_data = [ln.to_db_dict() for ln in self.cart.lines]
+        # Build atomic lottery records — sale + ledger written in ONE db transaction.
+        lottery_records = [
+            {
+                "entry_type": "payout" if ln.unit_price_cents < 0 else "sale",
+                "amount_cents": abs(ln.unit_price_cents) * ln.quantity,
+                "cashier_name": self.cashier.name,
+                "shift_id": self.shift_id,
+                "description": ln.name,
+            }
+            for ln in self.cart.lines if ln.kind == "lottery"
+        ]
         try:
-            tid = db.insert_transaction(txn.header_dict(), items_data)
+            tid = db.insert_transaction_with_lottery(
+                txn.header_dict(), items_data, lottery_records,
+            )
         except Exception:
             log.exception("cash transaction insert failed")
             self._error("Failed to save transaction. See errors.log.")
             return
-        # Lottery sale lines also written to lottery_ledger
-        for ln in self.cart.lines:
-            if ln.kind == "lottery":
-                try:
-                    db.log_lottery(
-                        "sale",
-                        ln.unit_price_cents * ln.quantity,
-                        self.cashier.name,
-                        shift_id=self.shift_id,
-                        transaction_id=tid,
-                        description=ln.name,
-                    )
-                except Exception:
-                    log.exception("lottery_ledger insert failed")
-        # Hardware stubs
+        # Save → Print → Clear. Print failure surfaces a clear alert so cashier
+        # can manually reprint via the Reprint button (we still stash the txn).
         self._open_cash_drawer()
-        self._print_receipt(txn, tid)
-        self._play_success()
+        self._last_txn = txn
+        self._last_tid = tid
+        print_ok = True
+        try:
+            self._print_receipt(txn, tid)
+        except Exception:
+            log.exception("receipt print failed")
+            print_ok = False
+        # Cash finalize: cha-ching sound (cash only — card path doesn't trigger).
+        self._play_chaching()
+        if not print_ok:
+            self._error("Sale saved but receipt failed to print. Use Reprint.")
         self._show_change_dialog(ref, change_cents)
-        # Reset register state
+        # Reset register state — also clear split-payment running tally.
         self.cart.clear()
+        self._cash_partial_cents = 0
+        try: self.cart_widget.totals_panel.set_partial_paid(0)
+        except Exception: pass
         self._numpad_clear()
         self.cart_widget.refresh()
         self._refresh_deals_banner()
 
     def _open_cash_drawer(self) -> None:
         log.info("[STUB] cash drawer kick signal")
+
+    def _on_print_button(self) -> None:
+        """Print Receipt button:
+        - Cart has items → render preview receipt of current cart (no DB save).
+        - Cart empty → ask 'Print last receipt?' YES → reprint last completed
+          transaction (in-memory cache OR DB fallback).
+        """
+        if self.cart.is_empty():
+            dlg = PrintReceiptDialog(
+                parent=self,
+                title="Reprint Last Receipt?",
+                subtitle="Print the last completed receipt?",
+                detail="Cart is empty — this will reprint the most recent transaction.",
+                ok_label="Reprint",
+            )
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            # In-memory cached last txn first (fast).
+            if self._last_txn is not None and self._last_tid is not None:
+                try:
+                    self._print_receipt(self._last_txn, self._last_tid)
+                    return
+                except Exception:
+                    log.exception("reprint cached failed")
+            # Fallback: load most recent completed txn from DB.
+            try:
+                rec = db.get_last_completed_transaction()
+            except Exception:
+                log.exception("get_last_completed_transaction failed")
+                rec = None
+            if rec is None:
+                self._info("No completed transactions to reprint.")
+                return
+            try:
+                from core.models import Transaction as _Txn
+                txn = _Txn.from_db(rec["transaction"], rec["items"])
+                self._print_receipt(txn, rec["transaction"]["id"])
+            except Exception:
+                log.exception("reprint from db failed")
+                self._error("Failed to reprint last receipt.")
+            return
+        # Build a preview Transaction (status='preview', no DB insert).
+        t = self.cart.totals
+        from core.models import Transaction
+        try:
+            preview = Transaction(
+                transaction_ref=f"PREVIEW-{int(_time.time())}",
+                subtotal_cents=t["subtotal_cents"],
+                discount_cents=t["discount_cents"],
+                gst_cents=t["gst_cents"],
+                pst_cents=t["pst_cents"],
+                deposit_cents=t["deposit_cents"],
+                bag_charge_cents=t["bag_charge_cents"],
+                total_cents=t["total_cents"],
+                rounded_total_cents=t["rounded_total_cents"],
+                payment_method="preview",
+                cash_tendered_cents=0,
+                change_cents=0,
+                cashier_id=self.cashier.id,
+                cashier_name=self.cashier.name,
+                shift_id=self.shift_id,
+                items=list(self.cart.lines),
+            )
+            self._print_receipt(preview, tid=-1)
+        except Exception:
+            log.exception("preview print failed")
+            self._error("Failed to print preview receipt.")
+
+    def _on_reprint_last(self) -> None:
+        """Reprint the most recent completed transaction's receipt."""
+        if self._last_txn is None or self._last_tid is None:
+            self._info("No recent transaction to reprint.")
+            return
+        log.info("reprint requested for tid=%s ref=%s",
+                 self._last_tid, self._last_txn.transaction_ref)
+        self._print_receipt(self._last_txn, self._last_tid)
 
     def _print_receipt(self, txn: Transaction, tid: int) -> None:
         # PDF fallback always; ESC/POS thermal attempted only when explicitly enabled.
@@ -930,6 +1405,10 @@ class RegisterScreen(QWidget):
         dlg.exec()
 
     def _on_card(self) -> None:
+        self._last_dept_add = None
+        if self._payment_locked:
+            log.info("card press ignored — payment in progress")
+            return
         if self.cart.is_empty():
             self._info("Cart is empty.")
             return
@@ -939,8 +1418,13 @@ class RegisterScreen(QWidget):
         if self._payment_thread is not None:
             self._info("Payment already in progress.")
             return
+        # Lock until card response handled (success, decline, cancel).
+        self._payment_locked = True
 
-        amount = self.cart.totals["total_cents"]   # card = exact, no rounding
+        # Card charges only the REMAINING balance after any cash partials.
+        total_cents = self.cart.totals["total_cents"]
+        partial = self._cash_partial_cents
+        amount = total_cents - partial
         if amount <= 0:
             self._error("Total is $0 — nothing to charge.")
             return
@@ -1006,22 +1490,26 @@ class RegisterScreen(QWidget):
         self._dismiss_sheet()
         self._pending_card_req = None
         # Persist transaction FIRST so the receipt can read it back from the DB.
-        self._finalize_card_db(req, resp)
-        if self._confirm("Print receipt?"):
-            self._print_receipt_card_stub(req, resp)
+        try:
+            self._finalize_card_db(req, resp)
+            if self._confirm("Print receipt?"):
+                self._print_receipt_card_stub(req, resp)
+        finally:
+            # Always release the payment lock, even if save/print raises.
+            self._payment_locked = False
 
     def _after_card_declined(self, resp: PaymentResponse) -> None:
         self._dismiss_sheet()
         self._pending_card_req = None
+        self._payment_locked = False
         self._show_toast(f"Card Declined — {resp.error_message or 'try again'}", danger=True)
 
     def _on_sheet_cancel(self) -> None:
         # Cashier-initiated cancel BEFORE terminal responds.
-        # Mock can't be aborted mid-sleep; just dismiss visually and let the
-        # response (already pending) be discarded by lock_cancel state.
         log.info("card payment cancel requested by cashier")
         self._dismiss_sheet()
         self._pending_card_req = None
+        self._payment_locked = False
         # Worker still finishes; _on_card_response sees no sheet → bails out.
 
     def _on_sheet_try_again(self) -> None:
@@ -1035,6 +1523,7 @@ class RegisterScreen(QWidget):
     def _on_sheet_accept_cash(self) -> None:
         self._dismiss_sheet()
         self._pending_card_req = None
+        self._payment_locked = False
         self._info("Enter cash tender on the numpad, then press Cash.")
 
     def _dismiss_sheet(self) -> None:
@@ -1044,6 +1533,7 @@ class RegisterScreen(QWidget):
     def _dismiss_sheet_and_clear_req(self) -> None:
         self._dismiss_sheet()
         self._pending_card_req = None
+        self._payment_locked = False
 
     def _show_toast(self, message: str, *, danger: bool = False) -> None:
         toast = Toast(self, message, danger=danger)
@@ -1051,6 +1541,8 @@ class RegisterScreen(QWidget):
 
     def _finalize_card_db(self, req: PaymentRequest, resp: PaymentResponse) -> None:
         t = self.cart.totals
+        partial_cash = self._cash_partial_cents
+        is_split = partial_cash > 0
         txn = Transaction(
             transaction_ref=req.transaction_ref,
             subtotal_cents=t["subtotal_cents"],
@@ -1061,8 +1553,8 @@ class RegisterScreen(QWidget):
             bag_charge_cents=t["bag_charge_cents"],
             total_cents=t["total_cents"],
             rounded_total_cents=t["total_cents"],
-            payment_method="card",
-            cash_tendered_cents=0,
+            payment_method="split" if is_split else "card",
+            cash_tendered_cents=partial_cash,
             change_cents=0,
             card_amount_cents=req.amount_cents,
             card_auth_code=resp.auth_code,
@@ -1093,6 +1585,9 @@ class RegisterScreen(QWidget):
                 except Exception:
                     log.exception("lottery_ledger insert failed")
         self.cart.clear()
+        self._cash_partial_cents = 0
+        try: self.cart_widget.totals_panel.set_partial_paid(0)
+        except Exception: pass   # reset split-payment running tally
         self._numpad_clear()
         self.cart_widget.refresh()
         self._refresh_deals_banner()
@@ -1140,30 +1635,41 @@ class RegisterScreen(QWidget):
             items=list(self.cart.lines),
         )
         items_data = [ln.to_db_dict() for ln in self.cart.lines]
+        lottery_records = [
+            {
+                "entry_type": "payout" if ln.unit_price_cents < 0 else "sale",
+                "amount_cents": abs(ln.unit_price_cents) * ln.quantity,
+                "cashier_name": self.cashier.name,
+                "shift_id": self.shift_id,
+                "description": ln.name,
+            }
+            for ln in self.cart.lines if ln.kind == "lottery"
+        ]
         try:
-            tid = db.insert_transaction(txn.header_dict(), items_data)
+            tid = db.insert_transaction_with_lottery(
+                txn.header_dict(), items_data, lottery_records,
+            )
         except Exception:
             log.exception("card transaction insert failed")
             self._error("Failed to save transaction. See errors.log.")
             return
-        for ln in self.cart.lines:
-            if ln.kind == "lottery":
-                try:
-                    db.log_lottery(
-                        "sale",
-                        ln.unit_price_cents * ln.quantity,
-                        self.cashier.name,
-                        shift_id=self.shift_id,
-                        transaction_id=tid,
-                        description=ln.name,
-                    )
-                except Exception:
-                    log.exception("lottery_ledger insert failed")
-        self._print_receipt(txn, tid)
+        # Save first; receipt is OPTIONAL on card (cardholder usually has slip).
+        self._last_txn = txn
+        self._last_tid = tid
         last4 = resp.card_last4 or "????"
-        self._info(
-            f"APPROVED\n\n{req.transaction_ref}\nAuth: {resp.auth_code}\nCard …{last4}"
+        # Card path does NOT play cha-ching (cash-drawer specific) and does NOT
+        # auto-open the cash drawer.
+        dlg = PrintReceiptDialog(
+            parent=self,
+            subtitle="Print receipt for the customer?",
+            detail=f"APPROVED  ·  {req.transaction_ref}  ·  Auth {resp.auth_code}  ·  …{last4}",
         )
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            try:
+                self._print_receipt(txn, tid)
+            except Exception:
+                log.exception("receipt print failed")
+                self._error("Receipt failed to print. Use Reprint button.")
         self.cart.clear()
         self._numpad_clear()
         self.cart_widget.refresh()
@@ -1220,6 +1726,8 @@ class RegisterScreen(QWidget):
             return
         if self._confirm("Clear the entire cart?"):
             self.cart.clear()
+            self._cash_partial_cents = 0
+            self._last_dept_add = None
             self.cart_widget.refresh()
             self._numpad_clear()
             self._refresh_deals_banner()
@@ -1236,20 +1744,24 @@ class RegisterScreen(QWidget):
         self._refresh_deals_banner()
 
     def _on_lottery_minus(self) -> None:
+        """Lottery payout = NEGATIVE cart line. No confirm popup.
+        Total reduces accordingly; if cart was empty, total goes negative.
+        Logged via lottery_ledger at payment time (atomic with sale).
+        """
         cents = self._numpad_cents()
         if cents <= 0:
-            self._info("Enter payout amount on numpad first.")
-            return
-        if not self._confirm(f"Lottery payout ${cents/100:.2f}?"):
+            self._error("Enter payout amount on the numpad first.")
             return
         try:
-            db.log_lottery("payout", cents, self.cashier.name, shift_id=self.shift_id)
+            ln = self.cart.add_lottery_payout(cents)
         except Exception:
-            log.exception("lottery payout insert failed")
-            self._error("Failed to log payout.")
+            log.exception("lottery payout add failed")
+            self._error("Failed to add payout line.")
             return
-        self._open_cash_drawer()
-        self._info(f"Payout of ${cents/100:.2f} dispensed.")
+        idx = self.cart.lines.index(ln)
+        self._numpad_clear()
+        self.cart_widget.refresh(flash_index=idx)
+        self._refresh_deals_banner()
         self._numpad_clear()
 
     def _on_eod(self) -> None:
@@ -1355,6 +1867,7 @@ class RegisterScreen(QWidget):
             self._error("Failed to hold cart.")
             return
         self.cart.clear()
+        self._last_dept_add = None
         self.cart_widget.refresh()
         self._refresh_held_count()
         self._refresh_deals_banner()
@@ -1913,52 +2426,754 @@ class CashCountDialog(QDialog):
         self.accept()
 
 
+# ─── Item picker (cashier search → choose from partial-match list) ──────────
+
+class PrintReceiptDialog(QDialog):
+    """Premium receipt confirmation dialog.
+
+    Custom-styled QDialog (replaces the native QMessageBox.question with the
+    big stock '?' icon). Navy title bar, soft body, two pill buttons:
+    No Thanks (ghost) and Print Receipt (success / default).
+
+    UX:
+      - Enter accepts (prints).
+      - ESC rejects (skips print).
+      - Print button auto-focused.
+    """
+
+    def __init__(self, *, title: str = "Receipt Options",
+                 subtitle: str = "Print customer receipt?",
+                 detail: str = "You can also reprint later from Receipts.",
+                 parent: Optional[QWidget] = None,
+                 ok_label: str = "Print Receipt",
+                 cancel_label: str = "No Thanks"):
+        super().__init__(parent)
+        self.setObjectName("print_receipt_dialog")
+        self.setWindowTitle(title)
+        self.setModal(True)
+        self.setWindowFlags(
+            Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+
+        self.setStyleSheet(
+            styles.premium_dialog_qss() + styles.dialog_titlebar_qss()
+            + "QFrame#prdShadow { background: white; border-radius: 14px;"
+            "  border: 1px solid #E1E4EA; }"
+        )
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(20, 20, 20, 20)
+
+        shadow = QFrame()
+        shadow.setObjectName("prdShadow")
+        sv = QVBoxLayout(shadow)
+        sv.setContentsMargins(0, 0, 0, 0)
+        sv.setSpacing(0)
+
+        # Navy title bar
+        title_bar = QFrame()
+        title_bar.setObjectName("dialogTitle")
+        tb = QHBoxLayout(title_bar)
+        tb.setContentsMargins(0, 0, 0, 0)
+        tlbl = QLabel(title)
+        tlbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        tb.addWidget(tlbl)
+        sv.addWidget(title_bar)
+
+        # Body
+        body = QVBoxLayout()
+        body.setContentsMargins(28, 22, 28, 18)
+        body.setSpacing(10)
+
+        # Receipt glyph + subtitle
+        head = QHBoxLayout()
+        head.setSpacing(14)
+        glyph = QLabel("🧾")
+        gf = QFont(styles.FONT_FAMILY, 28); glyph.setFont(gf)
+        glyph.setStyleSheet("background: transparent;")
+        head.addWidget(glyph)
+        sub_v = QVBoxLayout(); sub_v.setSpacing(2)
+        sub = QLabel(subtitle)
+        sf = QFont(styles.FONT_FAMILY, 13); sf.setBold(True)
+        sub.setFont(sf)
+        sub.setStyleSheet(f"color: {styles.COLORS['navy']}; background: transparent;")
+        sub_v.addWidget(sub)
+        if detail:
+            det = QLabel(detail)
+            det.setStyleSheet("color: #5A6573; font-size: 10pt; background: transparent;")
+            det.setWordWrap(True)
+            sub_v.addWidget(det)
+        head.addLayout(sub_v, stretch=1)
+        body.addLayout(head)
+
+        # Buttons
+        btns = QHBoxLayout()
+        btns.setSpacing(12)
+        cancel = QPushButton(cancel_label)
+        cancel.setObjectName("prd_cancel")
+        cancel.setMinimumSize(180, 56)
+        cancel.setStyleSheet(styles.pill_button_qss("ghost"))
+        cancel.clicked.connect(self.reject)
+        btns.addWidget(cancel, stretch=1)
+
+        ok = QPushButton(ok_label)
+        ok.setObjectName("prd_ok")
+        ok.setMinimumSize(180, 56)
+        ok.setDefault(True)
+        ok.setAutoDefault(True)
+        ok.setStyleSheet(styles.pill_button_qss("success"))
+        ok.clicked.connect(self.accept)
+        btns.addWidget(ok, stretch=1)
+        body.addLayout(btns)
+
+        sv.addLayout(body)
+        outer.addWidget(shadow)
+
+        self.setMinimumSize(500, 240)
+        self.resize(520, 260)
+        # Auto-focus Print so Enter prints immediately.
+        ok.setFocus()
+
+    def keyPressEvent(self, ev) -> None:
+        if ev.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self.accept(); return
+        if ev.key() == Qt.Key.Key_Escape:
+            self.reject(); return
+        super().keyPressEvent(ev)
+
+
+class ItemPickerDialog(QDialog):
+    """Premium product search picker.
+
+    Layout: navy title bar + live debounced search field + table with
+    UPC | Description | Department | Price columns + footer with result
+    count and Cancel/Add buttons. Enter or double-click adds; ESC closes.
+    """
+
+    def __init__(self, items: list, parent: Optional[QWidget] = None,
+                 *, initial_query: str = ""):
+        super().__init__(parent)
+        self.setObjectName("item_picker_dialog")
+        self.setWindowTitle("Search Results")
+        self.setModal(True)
+        self.picked = None  # type: Optional[dict]
+        self._initial_items = list(items)
+
+        from PyQt6.QtWidgets import (
+            QHeaderView as _QHeaderView,
+            QTableWidget as _QTable,
+            QTableWidgetItem as _QTI,
+            QAbstractItemView as _QAIV,
+        )
+        self._QTable = _QTable
+        self._QTI = _QTI
+
+        self.setStyleSheet(
+            styles.premium_dialog_qss()
+            + styles.dialog_titlebar_qss()
+            + styles.premium_table_qss()
+        )
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # Navy title bar
+        title_bar = QFrame()
+        title_bar.setObjectName("dialogTitle")
+        tb = QHBoxLayout(title_bar); tb.setContentsMargins(0, 0, 0, 0)
+        tlbl = QLabel("Product Search")
+        tlbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        tb.addWidget(tlbl)
+        outer.addWidget(title_bar)
+
+        body = QFrame()
+        body.setObjectName("card")
+        bv = QVBoxLayout(body)
+        bv.setContentsMargins(18, 14, 18, 14)
+        bv.setSpacing(10)
+        wrap = QVBoxLayout(); wrap.setContentsMargins(14, 12, 14, 12); wrap.setSpacing(0)
+        wrap.addWidget(body)
+        outer.addLayout(wrap, stretch=1)
+
+        # Live search field
+        self._search = QLineEdit()
+        self._search.setObjectName("picker_search")
+        self._search.setProperty("touchKeyboard", "text")
+        self._search.setPlaceholderText("Search by name or UPC…")
+        self._search.setText(initial_query)
+        self._search.setMinimumHeight(42)
+        self._search.returnPressed.connect(self._accept)
+        bv.addWidget(self._search)
+
+        # Table
+        self._table = _QTable()
+        self._table.setObjectName("picker_table")
+        self._table.setColumnCount(4)
+        self._table.setHorizontalHeaderLabels(["UPC", "Description", "Department", "Price"])
+        self._table.setEditTriggers(_QAIV.EditTrigger.NoEditTriggers)
+        self._table.setSelectionBehavior(_QAIV.SelectionBehavior.SelectRows)
+        self._table.setSelectionMode(_QAIV.SelectionMode.SingleSelection)
+        self._table.setAlternatingRowColors(True)
+        self._table.setShowGrid(False)
+        self._table.verticalHeader().setVisible(False)
+        self._table.verticalHeader().setDefaultSectionSize(40)
+        hh = self._table.horizontalHeader()
+        hh.setSectionResizeMode(_QHeaderView.ResizeMode.Stretch)
+        hh.setStretchLastSection(False)
+        self._table.itemDoubleClicked.connect(lambda _it: self._accept())
+        bv.addWidget(self._table, stretch=1)
+
+        # Footer
+        footer = QHBoxLayout(); footer.setSpacing(12)
+        self._count_lbl = QLabel("")
+        self._count_lbl.setStyleSheet("color: #5A6573; font-size: 10pt;")
+        footer.addWidget(self._count_lbl)
+        footer.addStretch(1)
+        cancel = QPushButton("Cancel")
+        cancel.setObjectName("picker_cancel")
+        cancel.setMinimumSize(120, 44)
+        cancel.setStyleSheet(styles.pill_button_qss("ghost"))
+        cancel.clicked.connect(self.reject)
+        footer.addWidget(cancel)
+        ok = QPushButton("Add to Cart")
+        ok.setObjectName("picker_ok")
+        ok.setMinimumSize(180, 44)
+        ok.setDefault(True)
+        ok.setStyleSheet(styles.pill_button_qss("success"))
+        ok.clicked.connect(self._accept)
+        footer.addWidget(ok)
+        bv.addLayout(footer)
+
+        # Debounced search
+        self._debounce = QTimer(self)
+        self._debounce.setSingleShot(True)
+        self._debounce.setInterval(180)
+        self._debounce.timeout.connect(self._refresh_table)
+        self._search.textChanged.connect(lambda _t: self._debounce.start())
+
+        self.setMinimumSize(720, 480)
+        self.resize(760, 520)
+        self._refresh_table()
+        self._table.setFocus()
+
+    def _refresh_table(self) -> None:
+        q = (self._search.text() or "").strip()
+        if not q:
+            rows = self._initial_items
+        else:
+            try:
+                rows = db.search_items(q, active_only=True, limit=200)
+            except Exception:
+                log.exception("picker search failed")
+                rows = []
+        self._table.setRowCount(len(rows))
+        for ri, r in enumerate(rows):
+            upc = self._QTI(r.get("barcode") or "")
+            upc.setData(Qt.ItemDataRole.UserRole, r)
+            self._table.setItem(ri, 0, upc)
+            self._table.setItem(ri, 1, self._QTI(r.get("name", "")))
+            self._table.setItem(ri, 2, self._QTI(r.get("department", "")))
+            price = self._QTI(f"${r.get('price_cents', 0)/100:.2f}")
+            price.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            self._table.setItem(ri, 3, price)
+        if rows:
+            self._table.selectRow(0)
+        n = len(rows)
+        self._count_lbl.setText(f"{n} result{'' if n == 1 else 's'}")
+
+    def _accept(self) -> None:
+        rows = self._table.selectionModel().selectedRows()
+        if not rows:
+            return
+        ri = rows[0].row()
+        cell = self._table.item(ri, 0)
+        if cell is None:
+            return
+        self.picked = cell.data(Qt.ItemDataRole.UserRole)
+        self.accept()
+
+    def keyPressEvent(self, ev) -> None:
+        # Enter on the table accepts; ESC closes (default).
+        if ev.key() == Qt.Key.Key_Return or ev.key() == Qt.Key.Key_Enter:
+            if self._table.hasFocus():
+                self._accept(); return
+        super().keyPressEvent(ev)
+
+    def closeEvent(self, ev) -> None:
+        try:
+            self._debounce.stop()
+        except Exception:
+            pass
+        # Ensure on-screen keyboard is closed alongside the picker.
+        try:
+            from ui.cashier.touch_keyboard import close_active_keyboard
+            close_active_keyboard()
+        except Exception:
+            pass
+        super().closeEvent(ev)
+
+
+# ─── Generic amount-entry dialog (lottery payout, dept manual entry) ────────
+
+class AmountEntryDialog(QDialog):
+    """Small modal: numpad-only amount entry. Returns `cents` on accept.
+
+    Buffer convention matches main numpad: digits-only string read as cents.
+    """
+
+    PRICE_MAX_DIGITS = 7
+
+    def __init__(self, title: str, total_cents: int = 0,
+                 parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.setObjectName("amount_entry_dialog")
+        self.setWindowTitle(title)
+        self.setModal(True)
+        self.setMinimumSize(360, 480)
+        self.cents = 0
+        self._buf = ""
+
+        v = QVBoxLayout(self)
+        v.setContentsMargins(20, 16, 20, 16)
+        v.setSpacing(10)
+
+        title_lbl = QLabel(title)
+        tf = QFont(styles.FONT_FAMILY, 16); tf.setBold(True)
+        title_lbl.setFont(tf)
+        title_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        v.addWidget(title_lbl)
+
+        self._input = QLineEdit("$0.00")
+        self._input.setObjectName("amt_dlg_input")
+        self._input.setReadOnly(True)
+        self._input.setAlignment(Qt.AlignmentFlag.AlignRight)
+        df = QFont(styles.FONT_FAMILY, 24); df.setBold(True)
+        self._input.setFont(df)
+        self._input.setStyleSheet(
+            "QLineEdit { padding: 8px; border: 2px solid #B0BEC5;"
+            " border-radius: 6px; background: white; }"
+        )
+        v.addWidget(self._input)
+
+        kp = QGridLayout(); kp.setSpacing(4)
+        for r, row in enumerate([["7","8","9"],["4","5","6"],["1","2","3"],["C","0","⌫"]]):
+            for c, ch in enumerate(row):
+                b = QPushButton(ch)
+                b.setObjectName(f"amt_kp_{ch}")
+                b.setMinimumHeight(50)
+                kf = QFont(styles.FONT_FAMILY, 18); kf.setBold(True)
+                b.setFont(kf)
+                b.setStyleSheet(
+                    "QPushButton { background-color: white; color: #333;"
+                    " border: 1px solid #DDD; border-radius: 4px; }"
+                    "QPushButton:pressed { background-color: #EEE; }"
+                )
+                b.clicked.connect(lambda _ck=False, x=ch: self._press(x))
+                kp.addWidget(b, r, c)
+        v.addLayout(kp)
+
+        btns = QHBoxLayout(); btns.setSpacing(10)
+        cancel = QPushButton("Cancel")
+        cancel.setObjectName("amt_dlg_cancel")
+        cancel.setMinimumHeight(48)
+        cancel.setStyleSheet(
+            f"QPushButton {{ background-color: {styles.COLORS['btn_void']}; color: white;"
+            f" border: none; border-radius: 6px; font-weight: bold; font-size: 13pt; }}"
+        )
+        cancel.clicked.connect(self.reject)
+        btns.addWidget(cancel)
+
+        self._ok = QPushButton("CONFIRM")
+        self._ok.setObjectName("amt_dlg_ok")
+        self._ok.setMinimumHeight(48)
+        self._ok.setStyleSheet(
+            f"QPushButton {{ background-color: {styles.COLORS['btn_cash']}; color: white;"
+            f" border: none; border-radius: 6px; font-weight: bold; font-size: 14pt; }}"
+            f"QPushButton:disabled {{ background-color: #BDBDBD; color: #757575; }}"
+        )
+        self._ok.setDefault(True)
+        self._ok.setEnabled(False)
+        self._ok.clicked.connect(self._accept)
+        btns.addWidget(self._ok, stretch=2)
+        v.addLayout(btns)
+
+    def _press(self, ch: str) -> None:
+        if ch == "⌫":
+            self._buf = self._buf[:-1]
+        elif ch == "C":
+            self._buf = ""
+        else:
+            cand = self._buf + ch
+            if len(cand) <= self.PRICE_MAX_DIGITS:
+                self._buf = cand.lstrip("0") or ""
+        cents = int(self._buf) if self._buf.isdigit() else 0
+        self._input.setText(f"${cents / 100:.2f}")
+        self._ok.setEnabled(cents > 0)
+
+    def _accept(self) -> None:
+        self.cents = int(self._buf) if self._buf.isdigit() else 0
+        if self.cents > 0:
+            self.accept()
+
+    def keyPressEvent(self, e):
+        from PyQt6.QtCore import Qt as _Qt
+        k = e.key()
+        if k in (_Qt.Key.Key_Return, _Qt.Key.Key_Enter):
+            if self._ok.isEnabled(): self._accept()
+            return
+        if k == _Qt.Key.Key_Escape:
+            self.reject(); return
+        if k == _Qt.Key.Key_Backspace:
+            self._press("⌫"); return
+        if k == _Qt.Key.Key_Delete:
+            self._press("C"); return
+        t = e.text()
+        if t and t in "0123456789":
+            self._press(t); return
+        super().keyPressEvent(e)
+
+
+# ─── Cash payment dialog (numpad + quicks + live change) ─────────────────────
+
+class CashPaymentDialog(QDialog):
+    """Modal cash-tender entry. Built-in numpad + quick amounts.
+
+    `received_cents` is exposed after `accept()`. Empty input → exact payment
+    (received_cents == 0; caller substitutes total).
+    Buffer convention matches main numpad: digits-only string interpreted as
+    cents (e.g. "500" → $5.00).
+    """
+
+    PRICE_MAX_DIGITS = 7   # $99,999.99
+
+    def __init__(self, total_cents: int, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.setObjectName("cash_payment_dialog")
+        self.setWindowTitle("Cash Payment")
+        self.setModal(True)
+        self.setMinimumSize(460, 640)
+        self.total_cents = int(total_cents)
+        self.received_cents = 0
+        self._buf = ""
+
+        v = QVBoxLayout(self)
+        v.setContentsMargins(20, 16, 20, 16)
+        v.setSpacing(10)
+
+        # Total — large, navy
+        lbl = QLabel("TOTAL")
+        lf = QFont(styles.FONT_FAMILY, 13); lf.setBold(True)
+        lbl.setFont(lf)
+        lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        v.addWidget(lbl)
+
+        amt = QLabel(f"${self.total_cents / 100:.2f}")
+        af = QFont(styles.FONT_FAMILY, 36); af.setBold(True)
+        amt.setFont(af)
+        amt.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        amt.setStyleSheet(f"color: {styles.COLORS['navy']};")
+        v.addWidget(amt)
+
+        # Input display (read-only, autofocus by being on top of focus chain)
+        self._input = QLineEdit("$0.00")
+        self._input.setObjectName("cash_dlg_input")
+        self._input.setReadOnly(True)
+        self._input.setAlignment(Qt.AlignmentFlag.AlignRight)
+        df = QFont(styles.FONT_FAMILY, 24); df.setBold(True)
+        self._input.setFont(df)
+        self._input.setStyleSheet(
+            "QLineEdit { padding: 10px; border: 2px solid #B0BEC5;"
+            " border-radius: 6px; background: white; }"
+        )
+        v.addWidget(self._input)
+
+        # Quick amounts: Exact / $5 / $10 / $20 / $50
+        quick = QHBoxLayout(); quick.setSpacing(6)
+        for label, cents in [("Exact", -1), ("$5", 500), ("$10", 1000),
+                             ("$20", 2000), ("$50", 5000)]:
+            b = QPushButton(label)
+            b.setObjectName(f"cash_quick_{label}")
+            b.setMinimumHeight(50)
+            qf = QFont(styles.FONT_FAMILY, 13); qf.setBold(True)
+            b.setFont(qf)
+            b.setStyleSheet(
+                "QPushButton { background-color: #F39C12; color: white;"
+                " border: none; border-radius: 6px; }"
+                "QPushButton:pressed { background-color: #C77E0E; }"
+            )
+            if cents == -1:
+                b.clicked.connect(self._set_exact)
+            else:
+                b.clicked.connect(lambda _ck=False, c=cents: self._add_quick(c))
+            quick.addWidget(b)
+        v.addLayout(quick)
+
+        # Numeric keypad
+        kp = QGridLayout(); kp.setSpacing(4)
+        layout_rows = [["7","8","9"], ["4","5","6"], ["1","2","3"], ["C","0","⌫"]]
+        for r, row in enumerate(layout_rows):
+            for c, ch in enumerate(row):
+                b = QPushButton(ch)
+                b.setObjectName(f"cash_kp_{ch}")
+                b.setMinimumHeight(54)
+                kf = QFont(styles.FONT_FAMILY, 18); kf.setBold(True)
+                b.setFont(kf)
+                b.setStyleSheet(
+                    "QPushButton { background-color: white; color: #333;"
+                    " border: 1px solid #DDD; border-radius: 4px; }"
+                    "QPushButton:pressed { background-color: #EEE; }"
+                )
+                b.clicked.connect(lambda _ck=False, x=ch: self._press(x))
+                kp.addWidget(b, r, c)
+        v.addLayout(kp)
+
+        # Live RECEIVED + CHANGE
+        self._received_lbl = QLabel("Received: $0.00")
+        rf = QFont(styles.FONT_FAMILY, 13); rf.setBold(True)
+        self._received_lbl.setFont(rf)
+        self._received_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        v.addWidget(self._received_lbl)
+
+        self._change_lbl = QLabel("Change: $0.00")
+        cf = QFont(styles.FONT_FAMILY, 22); cf.setBold(True)
+        self._change_lbl.setFont(cf)
+        self._change_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        v.addWidget(self._change_lbl)
+
+        # Cancel | CONFIRM
+        btns = QHBoxLayout(); btns.setSpacing(10)
+        cancel = QPushButton("Cancel")
+        cancel.setObjectName("cash_dlg_cancel")
+        cancel.setMinimumHeight(56)
+        cancel.setStyleSheet(
+            f"QPushButton {{ background-color: {styles.COLORS['btn_void']}; color: white;"
+            f" border: none; border-radius: 6px; font-weight: bold; font-size: 14pt; }}"
+        )
+        cancel.clicked.connect(self.reject)
+        btns.addWidget(cancel)
+
+        self._ok = QPushButton("CONFIRM")
+        self._ok.setObjectName("cash_dlg_ok")
+        self._ok.setMinimumHeight(56)
+        self._ok.setStyleSheet(
+            f"QPushButton {{ background-color: {styles.COLORS['btn_cash']}; color: white;"
+            f" border: none; border-radius: 6px; font-weight: bold; font-size: 16pt; }}"
+            f"QPushButton:disabled {{ background-color: #BDBDBD; color: #757575; }}"
+        )
+        self._ok.setDefault(True)
+        self._ok.clicked.connect(self._accept)
+        btns.addWidget(self._ok, stretch=2)
+        v.addLayout(btns)
+
+        self._update()
+
+    # ─── input handling ──────────────────────────────────────────────────────
+
+    def _press(self, ch: str) -> None:
+        if ch == "⌫":
+            self._buf = self._buf[:-1]
+        elif ch == "C":
+            self._buf = ""
+        else:  # digit
+            cand = self._buf + ch
+            if len(cand) <= self.PRICE_MAX_DIGITS:
+                # Strip leading zeros silently to keep display clean.
+                self._buf = cand.lstrip("0") or ch
+                if self._buf == "0":
+                    self._buf = ""
+        self._update()
+
+    def _add_quick(self, cents: int) -> None:
+        """Quick buttons ADD to current — enables stacked tenders ($20 + $5)."""
+        new = self._buf_to_cents() + cents
+        self._set_cents(new)
+
+    def _set_exact(self) -> None:
+        self._set_cents(self.total_cents)
+
+    def _set_cents(self, cents: int) -> None:
+        s = str(int(cents))
+        if len(s) > self.PRICE_MAX_DIGITS:
+            return
+        self._buf = s
+        self._update()
+
+    def _buf_to_cents(self) -> int:
+        return int(self._buf) if self._buf.isdigit() else 0
+
+    def _update(self) -> None:
+        cents = self._buf_to_cents()
+        self._input.setText(f"${cents / 100:.2f}")
+        self._received_lbl.setText(f"Received: ${cents / 100:.2f}")
+        if cents == 0:
+            # Empty input → exact payment fallback on confirm.
+            self._change_lbl.setText("Exact payment")
+            self._change_lbl.setStyleSheet(f"color: {styles.COLORS['text_muted']};")
+            self._ok.setEnabled(True)
+            return
+        if cents < self.total_cents:
+            short = self.total_cents - cents
+            self._change_lbl.setText(f"Short: -${short / 100:.2f}")
+            self._change_lbl.setStyleSheet(f"color: {styles.COLORS['danger']};")
+            self._ok.setEnabled(False)
+            return
+        change = cents - self.total_cents
+        self._change_lbl.setText(f"Change: ${change / 100:.2f}")
+        self._change_lbl.setStyleSheet(f"color: {styles.COLORS['btn_cash']};")
+        self._ok.setEnabled(True)
+
+    def _accept(self) -> None:
+        self.received_cents = self._buf_to_cents()
+        self.accept()
+
+    def keyPressEvent(self, e):
+        from PyQt6.QtCore import Qt as _Qt
+        k = e.key()
+        if k in (_Qt.Key.Key_Return, _Qt.Key.Key_Enter):
+            if self._ok.isEnabled():
+                self._accept()
+            return
+        if k == _Qt.Key.Key_Escape:
+            self.reject(); return
+        if k == _Qt.Key.Key_Backspace:
+            self._press("⌫"); return
+        if k == _Qt.Key.Key_Delete:
+            self._press("C"); return
+        t = e.text()
+        if t and t in "0123456789":
+            self._press(t); return
+        super().keyPressEvent(e)
+
+
 # ─── Change dialog ───────────────────────────────────────────────────────────
 
 class ChangeDialog(QDialog):
-    """Large change-due display shown after a cash sale completes."""
+    """Premium 'Payment Complete' dialog shown after cash sale completes.
 
-    def __init__(self, txn_ref: str, change_cents: int, parent: Optional[QWidget] = None):
+    Visual: navy title bar + soft body + green ✓ glyph + huge change amount +
+    'Cash payment accepted' caption + Done pill.
+
+    UX:
+      - Centered modal
+      - Enter / Esc → accept (close)
+      - Optional auto-close after 3s (caller controls via auto_close_ms)
+    """
+
+    def __init__(self, txn_ref: str, change_cents: int,
+                 parent: Optional[QWidget] = None,
+                 *, auto_close_ms: int = 0):
         super().__init__(parent)
         self.setObjectName("change_dialog")
-        self.setWindowTitle("Change Due")
+        self.setWindowTitle("Payment Complete")
         self.setModal(True)
-        self.setMinimumSize(360, 220)
+        self.setWindowFlags(
+            Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
 
-        v = QVBoxLayout(self)
-        v.setContentsMargins(24, 24, 24, 24)
-        v.setSpacing(16)
-        v.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setStyleSheet(
+            styles.premium_dialog_qss() + styles.dialog_titlebar_qss()
+            + "QFrame#cdShadow { background: white; border-radius: 14px;"
+            "  border: 1px solid #E1E4EA; }"
+            f"QLabel#cd_amount {{ color: {styles.COLORS['btn_cash']}; }}"
+        )
 
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(24, 24, 24, 24)
+
+        shadow = QFrame()
+        shadow.setObjectName("cdShadow")
+        sv = QVBoxLayout(shadow)
+        sv.setContentsMargins(0, 0, 0, 0); sv.setSpacing(0)
+
+        # Title bar
+        title_bar = QFrame()
+        title_bar.setObjectName("dialogTitle")
+        tb = QHBoxLayout(title_bar); tb.setContentsMargins(0, 0, 0, 0)
+        tlbl = QLabel("Payment Complete")
+        tlbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        tb.addWidget(tlbl)
+        sv.addWidget(title_bar)
+
+        body = QVBoxLayout()
+        body.setContentsMargins(28, 22, 28, 22)
+        body.setSpacing(8)
+        body.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+
+        # Transaction ref (small, muted)
         ref_lbl = QLabel(f"Transaction {txn_ref}")
-        ref_lbl.setObjectName("change_ref")
         ref_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        ref_lbl.setFont(QFont(styles.FONT_FAMILY, 11))
-        v.addWidget(ref_lbl)
+        ref_lbl.setStyleSheet("color: #8A8F95; font-size: 10pt; background: transparent;")
+        body.addWidget(ref_lbl)
 
+        # Success glyph
+        check = QLabel("✓")
+        check.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        cf = QFont(styles.FONT_FAMILY, 36); cf.setBold(True)
+        check.setFont(cf)
+        check.setStyleSheet(
+            f"color: {styles.COLORS['btn_cash']}; background: transparent;"
+        )
+        body.addWidget(check)
+
+        # "Change Due"
         change_lbl = QLabel("Change Due")
         change_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        change_lbl.setFont(QFont(styles.FONT_FAMILY, 14))
-        v.addWidget(change_lbl)
+        clf = QFont(styles.FONT_FAMILY, 12)
+        change_lbl.setFont(clf)
+        change_lbl.setStyleSheet("color: #5A6573; background: transparent;")
+        body.addWidget(change_lbl)
 
+        # Amount — huge, green
         amount = QLabel(f"${change_cents / 100:.2f}")
-        amount.setObjectName("change_amount")
+        amount.setObjectName("cd_amount")
         amount.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        af = QFont(styles.FONT_FAMILY, 48)
-        af.setBold(True)
+        af = QFont(styles.FONT_FAMILY, 56); af.setBold(True)
         amount.setFont(af)
-        amount.setStyleSheet(f"color: {styles.COLORS['btn_cash']};")
-        v.addWidget(amount)
-
-        ok = QPushButton("OK")
-        ok.setObjectName("change_ok")
-        ok.setMinimumHeight(48)
-        of = QFont(styles.FONT_FAMILY, 14)
-        of.setBold(True)
-        ok.setFont(of)
-        ok.setStyleSheet(
-            f"QPushButton {{ background-color: {styles.COLORS['btn_cash']}; color: white;"
-            f" border: none; border-radius: 6px; padding: 8px 24px; }}"
+        amount.setStyleSheet(
+            f"color: {styles.COLORS['btn_cash']}; background: transparent;"
+            f" padding: 4px;"
         )
+        body.addWidget(amount)
+
+        # Caption
+        caption = QLabel("Cash payment accepted")
+        caption.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        caption.setStyleSheet("color: #8A8F95; font-size: 10pt; background: transparent;")
+        body.addWidget(caption)
+
+        body.addSpacing(6)
+
+        # Done button
+        ok = QPushButton("Done")
+        ok.setObjectName("change_ok")
+        ok.setMinimumSize(220, 56)
+        ok.setDefault(True)
+        ok.setAutoDefault(True)
+        ok.setStyleSheet(styles.pill_button_qss("success"))
         ok.clicked.connect(self.accept)
-        v.addWidget(ok)
+        ok_row = QHBoxLayout()
+        ok_row.addStretch(1); ok_row.addWidget(ok); ok_row.addStretch(1)
+        body.addLayout(ok_row)
+
+        sv.addLayout(body)
+        outer.addWidget(shadow)
+
+        self.setMinimumSize(440, 360)
+        self.resize(460, 380)
+        ok.setFocus()
+
+        # Optional auto-close (caller decides) — non-blocking timer.
+        if auto_close_ms > 0:
+            self._auto_timer = QTimer(self)
+            self._auto_timer.setSingleShot(True)
+            self._auto_timer.setInterval(int(auto_close_ms))
+            self._auto_timer.timeout.connect(self.accept)
+            self._auto_timer.start()
+
+    def keyPressEvent(self, ev) -> None:
+        if ev.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Escape):
+            self.accept(); return
+        super().keyPressEvent(ev)

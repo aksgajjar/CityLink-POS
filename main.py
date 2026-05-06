@@ -179,55 +179,7 @@ class OpenShiftDialog(QDialog):
         self.accept()
 
 
-# ─── Admin dashboard stub ────────────────────────────────────────────────────
-
-class AdminDashboard(QWidget):
-    """Placeholder admin home. Real dashboard built in Phase 1 step 27."""
-
-    logout_requested = pyqtSignal()
-
-    def __init__(self, admin_user: User, parent: Optional[QWidget] = None):
-        super().__init__(parent)
-        self.setObjectName("admin_dashboard")
-        self._build(admin_user)
-
-    def _build(self, admin_user: User) -> None:
-        v = QVBoxLayout(self)
-        v.setContentsMargins(40, 40, 40, 40)
-        v.setSpacing(16)
-        v.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-        title = QLabel(f"ADMIN — {admin_user.name}")
-        title.setObjectName("admin_title")
-        f = QFont(styles.FONT_FAMILY, 24); f.setBold(True)
-        title.setFont(f)
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        title.setStyleSheet(f"color: {styles.COLORS['navy']};")
-        v.addWidget(title)
-
-        msg = QLabel(
-            "Admin dashboard not built yet.\n\n"
-            "Phase 1 steps 22-27 will add: Inventory · Deals · Cash Mgmt ·\n"
-            "Reports · Users · Terminal config · Store settings."
-        )
-        msg.setObjectName("admin_msg")
-        msg.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        msg.setFont(QFont(styles.FONT_FAMILY, 12))
-        v.addWidget(msg)
-
-        v.addStretch(1)
-
-        back = QPushButton("Lock — Back to PIN")
-        back.setObjectName("admin_back")
-        back.setMinimumSize(240, 56)
-        bf = QFont(styles.FONT_FAMILY, 14); bf.setBold(True)
-        back.setFont(bf)
-        back.setStyleSheet(
-            f"QPushButton {{ background-color: {styles.COLORS['btn_void']}; color: white;"
-            f" border: none; border-radius: 6px; padding: 10px 24px; }}"
-        )
-        back.clicked.connect(self.logout_requested.emit)
-        v.addWidget(back, alignment=Qt.AlignmentFlag.AlignCenter)
+# Admin dashboard imported from ui.admin.dashboard (see _show_admin)
 
 
 # ─── Main window ─────────────────────────────────────────────────────────────
@@ -340,7 +292,13 @@ class MainWindow(QMainWindow):
         self._restart_inactivity_timer()
 
     def _show_admin(self) -> None:
-        self._admin = AdminDashboard(self._current_user)
+        from ui.admin.dashboard import AdminDashboard as _AdminDashboard
+        self._admin = _AdminDashboard(
+            self._current_user,
+            terminal=self.terminal,
+            sound_player=self.sound_player,
+            store=self.config.get("store", {}),
+        )
         self._admin.logout_requested.connect(self._on_logout)
         self.stack.addWidget(self._admin)
         self.stack.setCurrentWidget(self._admin)
@@ -471,6 +429,12 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     app = QApplication(sys.argv)
     app.setStyleSheet(styles.get_stylesheet())
+    # Touch-only deployment: auto-pop on-screen keyboard for QLineEdit focus.
+    try:
+        from ui.cashier.touch_keyboard import install_touch_keyboard
+        install_touch_keyboard(app)
+    except Exception:
+        log.exception("touch keyboard install failed")
     win = MainWindow(config)
     # Install app-wide click sound filter
     sound_filter = ClickSoundFilter(win.sound_player)

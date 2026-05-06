@@ -65,17 +65,19 @@ def compute_hints(lines: list[CartItem], deals: Iterable[Deal]) -> list[dict]:
     for d in deals:
         try:
             if d.deal_type in ("qty_discount", "spend_discount"):
-                target_id = d.trigger.get("item_id")
+                qual_ids = _trigger_item_ids(d)
                 need_qty = int(d.trigger.get("qty", 0))
-                if not target_id or need_qty <= 0:
+                if not qual_ids or need_qty <= 0:
                     continue
-                have = sum(ln.quantity for ln in lines if ln.item_id == target_id)
+                have = sum(ln.quantity for ln in lines if ln.item_id in qual_ids)
                 if 0 < have < need_qty:
                     if d.deal_type == "qty_discount":
-                        unit = next(
+                        # Best-case unit price among present qualifying items.
+                        present_units = [
                             ln.unit_price_cents for ln in lines
-                            if ln.item_id == target_id
-                        )
+                            if ln.item_id in qual_ids
+                        ]
+                        unit = max(present_units) if present_units else 0
                         savings = unit * need_qty - int(d.reward.get("total_price_cents", 0))
                     else:
                         savings = int(d.reward.get("discount_cents", 0))
@@ -83,7 +85,7 @@ def compute_hints(lines: list[CartItem], deals: Iterable[Deal]) -> list[dict]:
                         hints.append({
                             "deal_id": d.id,
                             "deal_name": d.name,
-                            "item_id": target_id,
+                            "item_id": qual_ids[0],
                             "need_qty": need_qty,
                             "have_qty": have,
                             "savings_cents": savings,
@@ -120,28 +122,66 @@ def compute_hints(lines: list[CartItem], deals: Iterable[Deal]) -> list[dict]:
 
 # ─── Per-type appliers ───────────────────────────────────────────────────────
 
-def _apply_qty_discount(lines: list[CartItem], d: Deal) -> None:
-    """trigger:{item_id, qty} reward:{total_price_cents}.
-    Buy `qty` of `item_id` for `total_price_cents` total. Repeats per group of `qty`.
+def _trigger_item_ids(d: Deal) -> list[int]:
+    """Return list of qualifying item ids. Supports both legacy
+    `{item_id: X}` and multi-item `{items: [X, Y, ...]}` triggers.
     """
-    target_id = d.trigger.get("item_id")
+    if "items" in d.trigger:
+        return [int(i) for i in (d.trigger.get("items") or []) if i]
+    iid = d.trigger.get("item_id")
+    return [int(iid)] if iid else []
+
+
+def _apply_qty_discount(lines: list[CartItem], d: Deal) -> None:
+    """trigger:{items:[ids] OR item_id} qty:N  reward:{total_price_cents}.
+    Buy `qty` total of ANY listed item(s) for `total_price_cents`.
+    Repeats in groups of `qty`. Discount allocated to the most expensive
+    qualifying units in each group (best for the customer).
+    """
+    qual_ids = _trigger_item_ids(d)
     need_qty = int(d.trigger.get("qty", 0))
     bundle_price = int(d.reward.get("total_price_cents", 0))
-    if not target_id or need_qty <= 0:
+    if not qual_ids or need_qty <= 0 or bundle_price < 0:
         return
-    for ln in lines:
-        if (
-            ln.item_id == target_id
-            and ln.deal_id is None
-            and ln.quantity >= need_qty
-        ):
-            bundles = ln.quantity // need_qty
-            regular = ln.unit_price_cents * need_qty * bundles
-            discounted = bundle_price * bundles
-            disc = regular - discounted
-            if disc > 0:
-                ln.deal_id = d.id
-                ln.deal_discount_cents = disc
+
+    # Collect (line, unit_price) for every unbound qualifying unit.
+    qual_lines = [
+        ln for ln in lines
+        if ln.kind == "item" and ln.item_id in qual_ids
+        and ln.deal_id is None and ln.quantity > 0
+    ]
+    total_qty = sum(ln.quantity for ln in qual_lines)
+    bundles = total_qty // need_qty
+    if bundles <= 0:
+        return
+
+    # Build expanded unit list (line_ref, price) sorted desc by price so
+    # discount applies to the most expensive units within each bundle.
+    units: list[tuple] = []
+    for ln in qual_lines:
+        for _ in range(ln.quantity):
+            units.append((ln, ln.unit_price_cents))
+    units.sort(key=lambda u: -u[1])
+
+    bundle_total_units = bundles * need_qty
+    chosen = units[:bundle_total_units]
+    regular = sum(p for _, p in chosen)
+    discounted = bundle_price * bundles
+    total_disc = regular - discounted
+    if total_disc <= 0:
+        return
+
+    # Tag every involved line with deal_id; place discount on the
+    # cheapest involved line so its `line_total` shows the savings prominently.
+    involved = {id(ln) for ln, _ in chosen}
+    for ln in qual_lines:
+        if id(ln) in involved:
+            ln.deal_id = d.id
+    # Pick a single line to carry the lump-sum discount.
+    cheapest = min((ln for ln, _ in chosen),
+                   key=lambda l: l.unit_price_cents, default=None)
+    if cheapest is not None:
+        cheapest.deal_discount_cents = total_disc
 
 
 def _apply_bundle(lines: list[CartItem], d: Deal) -> None:
@@ -157,7 +197,7 @@ def _apply_bundle(lines: list[CartItem], d: Deal) -> None:
     for need_id in item_ids:
         ln = next(
             (l for l in lines
-             if l.item_id == need_id and l.deal_id is None and l.quantity >= 1),
+             if l.kind == "item" and l.item_id == need_id and l.deal_id is None and l.quantity >= 1),
             None,
         )
         if ln is None:
@@ -173,23 +213,29 @@ def _apply_bundle(lines: list[CartItem], d: Deal) -> None:
 
 
 def _apply_spend_discount(lines: list[CartItem], d: Deal) -> None:
-    """trigger:{item_id, qty} reward:{discount_cents}.
-    Buy `qty` of item → flat `discount_cents` off. Repeats per group of `qty`.
+    """trigger:{items:[ids] OR item_id, qty} reward:{discount_cents}.
+    Buy `qty` total of any listed item(s) → flat `discount_cents` off.
+    Repeats per group of `qty`.
     """
-    target_id = d.trigger.get("item_id")
+    qual_ids = _trigger_item_ids(d)
     need_qty = int(d.trigger.get("qty", 0))
     disc = int(d.reward.get("discount_cents", 0))
-    if not target_id or need_qty <= 0 or disc <= 0:
+    if not qual_ids or need_qty <= 0 or disc <= 0:
         return
-    for ln in lines:
-        if (
-            ln.item_id == target_id
-            and ln.deal_id is None
-            and ln.quantity >= need_qty
-        ):
-            bundles = ln.quantity // need_qty
-            ln.deal_id = d.id
-            ln.deal_discount_cents = disc * bundles
+    qual_lines = [
+        ln for ln in lines
+        if ln.kind == "item" and ln.item_id in qual_ids
+        and ln.deal_id is None and ln.quantity > 0
+    ]
+    total_qty = sum(ln.quantity for ln in qual_lines)
+    bundles = total_qty // need_qty
+    if bundles <= 0:
+        return
+    # Tag all qualifying lines with the deal so they group visually; place
+    # the lump discount on the first qualifying line.
+    for ln in qual_lines:
+        ln.deal_id = d.id
+    qual_lines[0].deal_discount_cents = disc * bundles
 
 
 def _apply_cross_dept(lines: list[CartItem], d: Deal) -> None:
@@ -204,7 +250,7 @@ def _apply_cross_dept(lines: list[CartItem], d: Deal) -> None:
     if not any(l.department == trigger_dept for l in lines):
         return
     for ln in lines:
-        if ln.department == target_dept and ln.deal_id is None:
+        if ln.kind == "item" and ln.department == target_dept and ln.deal_id is None:
             gross = ln.unit_price_cents * ln.quantity
             ln.deal_id = d.id
             ln.deal_discount_cents = (gross * pct + 50) // 100   # half-up integer
