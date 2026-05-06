@@ -407,6 +407,34 @@ def _seed_admin_if_needed(pin: str) -> None:
     log.info("--seed-admin: created admin user id=%s with provided PIN", uid)
 
 
+def _seed_default_users_if_empty() -> None:
+    """First-run safety net: ensure the store has a usable login.
+
+    On a fresh DB (e.g. cloned repo, new device) the users table is empty,
+    so every PIN entry fails with 'Wrong PIN'. We seed two factory default
+    accounts so the cashier can log in immediately:
+
+        Admin   PIN 1234   role=admin
+        Cashier PIN 9999   role=cashier
+
+    Idempotent — only runs when the users table is empty (covers both
+    'never had any user' and 'admin deactivated and no cashier' cases).
+    """
+    try:
+        existing = db.list_users(active_only=False)
+    except Exception:
+        log.exception("default-user seed: list_users failed; skipping")
+        return
+    if existing:
+        return
+    try:
+        db.create_user("Admin", "1234", role="admin")
+        db.create_user("Cashier", "9999", role="cashier")
+        log.info("seeded factory default users (Admin/1234, Cashier/9999)")
+    except Exception:
+        log.exception("default-user seed: create_user failed")
+
+
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(prog="citylink-pos", description="CityLink POS")
     p.add_argument(
@@ -426,6 +454,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     config = load_config()
     apply_tax_rates_from_config(config)
     db.init_db()
+
+    # Factory default users — only inserted when the users table is empty.
+    _seed_default_users_if_empty()
 
     if args.seed_admin:
         _seed_admin_if_needed(args.seed_admin)
