@@ -24,6 +24,7 @@ import argparse
 import json
 import sys
 import time
+from datetime import date
 from pathlib import Path
 from typing import Optional
 
@@ -321,10 +322,29 @@ class MainWindow(QMainWindow):
 
         The shift stays OPEN — same cashier resumes it on next PIN entry.
         Admin closes shifts via EOD report (Phase 1 step 25).
+
+        Side effect: schedule a once-per-day DB backup snapshot. Cheap
+        operation (SQLite online backup); first logout of the day takes
+        the snapshot, subsequent logouts skip until tomorrow.
         """
         self._auto_hold_cart()
+        self._maybe_daily_backup()
         self._teardown_active()
         self._show_login()
+
+    def _maybe_daily_backup(self) -> None:
+        """Run db.backup_db() at most once per calendar day."""
+        today = date.today().isoformat()
+        last = getattr(self, "_last_backup_day", None)
+        if last == today:
+            return
+        try:
+            out = db.backup_db(dest_dir="data/backups", keep_last=14)
+            if out is not None:
+                self._last_backup_day = today
+                log.info("daily backup written: %s", out)
+        except Exception:
+            log.exception("daily backup failed")
 
     def _on_admin_requested(self) -> None:
         """Admin tapped Admin from register — switch to admin dashboard

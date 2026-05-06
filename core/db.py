@@ -229,11 +229,60 @@ def init_db(path: Path | str = DEFAULT_DB_PATH) -> sqlite3.Connection:
     _conn.row_factory = sqlite3.Row
     _conn.execute("PRAGMA foreign_keys = ON")
     _conn.execute("PRAGMA journal_mode = WAL")
+    # synchronous=NORMAL gives a 2-3× write speedup vs FULL with no
+    # corruption risk on power loss when journal_mode=WAL is on (per
+    # SQLite docs). Worst case is the last commit-in-flight is lost,
+    # never DB corruption — perfectly acceptable for a POS.
+    _conn.execute("PRAGMA synchronous = NORMAL")
+    # 30s busy timeout so concurrent reads (reports + cashier writes)
+    # don't surface "database is locked" on the cashier path.
+    _conn.execute("PRAGMA busy_timeout = 30000")
     _conn.executescript(SCHEMA_SQL)
     _conn.commit()
     _ensure_user_columns(_conn)
     log.info("db initialized at %s", path)
     return _conn
+
+
+def backup_db(*, dest_dir: Path | str = "data/backups",
+              keep_last: int = 14) -> Optional[Path]:
+    """Snapshot the live SQLite DB to a date-stamped file.
+
+    Uses SQLite's built-in `backup()` API (online backup — safe even with
+    open writers). Writes to `data/backups/store_YYYYMMDD_HHMMSS.db`.
+    Prunes oldest files beyond `keep_last`.
+
+    Returns the new backup path on success, None on failure. Idempotent —
+    safe to call from shift-close, EOD, or a one-shot admin button.
+    """
+    try:
+        dest_dir = Path(dest_dir)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out = dest_dir / f"store_{stamp}.db"
+        src = conn()
+        # Open destination fresh + use SQLite online backup API.
+        dest = sqlite3.connect(str(out))
+        try:
+            src.backup(dest)
+        finally:
+            dest.close()
+        log.info("[backup] db snapshot -> %s", out)
+        # Retention: keep most recent N files, delete older.
+        try:
+            backups = sorted(dest_dir.glob("store_*.db"))
+            for old in backups[:-keep_last]:
+                try:
+                    old.unlink()
+                    log.info("[backup] pruned %s", old.name)
+                except Exception:
+                    log.exception("[backup] could not prune %s", old)
+        except Exception:
+            log.exception("[backup] retention sweep failed")
+        return out
+    except Exception:
+        log.exception("[backup] db backup failed")
+        return None
 
 
 def _ensure_user_columns(c: sqlite3.Connection) -> None:
@@ -821,6 +870,32 @@ def list_transactions_for_shift(shift_id: int) -> list[dict]:
     rows = conn().execute(
         "SELECT * FROM transactions WHERE shift_id = ? ORDER BY id",
         (shift_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def list_shifts_in_range(start_iso: str, end_iso: str) -> list[dict]:
+    """Return shifts whose opened_at falls within [start_iso, end_iso].
+
+    Includes both open and closed shifts. Ordered newest first so the most
+    recent shift sits at the top of the terminal stats list.
+    """
+    rows = conn().execute(
+        """SELECT * FROM shifts
+           WHERE opened_at >= ? AND opened_at < ?
+           ORDER BY opened_at DESC""",
+        (start_iso, end_iso),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def list_transactions_in_range(start_iso: str, end_iso: str) -> list[dict]:
+    """Return transactions in [start_iso, end_iso) ordered by created_at."""
+    rows = conn().execute(
+        """SELECT * FROM transactions
+           WHERE created_at >= ? AND created_at < ?
+           ORDER BY created_at""",
+        (start_iso, end_iso),
     ).fetchall()
     return [dict(r) for r in rows]
 
