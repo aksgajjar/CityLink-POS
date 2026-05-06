@@ -1197,6 +1197,9 @@ class RegisterScreen(QWidget):
         Buffer empty + no prior partials → exact payment.
         Buffer < remaining → partial: accumulate, transaction stays open.
         Buffer >= remaining → finalize (cash-only or split if prior partials).
+
+        Special case: cart total < 0 (lottery payout only) → finalize as
+        payout transaction without partial/change/paid-in-full logic.
         """
         self._last_dept_add = None
         if self._payment_locked:
@@ -1207,6 +1210,15 @@ class RegisterScreen(QWidget):
             return
         rounded = self.cart.totals["rounded_total_cents"]
         partial = self._cash_partial_cents
+        # ── Lottery payout flow: cart total negative, cashier hands money OUT.
+        # Skip tender/change/partial logic; finalize directly.
+        if rounded < 0 and partial == 0 and self._is_payout_only_cart():
+            self._payment_locked = True
+            try:
+                self._finalize_payout(rounded)
+            finally:
+                self._payment_locked = False
+            return
         remaining = rounded - partial
         if remaining <= 0:
             self._info("Already paid in full. Press Cancel to clear or scan next sale.")
@@ -1238,6 +1250,106 @@ class RegisterScreen(QWidget):
             self._finalize_cash(tender_total, change)
         finally:
             self._payment_locked = False
+
+    def _is_payout_only_cart(self) -> bool:
+        """True if the cart contains ONLY lottery payout lines (negative
+        unit_price). Mixed carts (sale items + lottery winnings) follow the
+        normal cash flow because a positive subtotal still needs tendering.
+        """
+        any_payout = False
+        for ln in self.cart.lines:
+            if ln.kind == "lottery" and ln.unit_price_cents < 0:
+                any_payout = True
+                continue
+            # Any non-payout line disqualifies (regular item, bag, lottery sale)
+            return False
+        return any_payout
+
+    def _finalize_payout(self, rounded_cents: int) -> None:
+        """Lottery-payout-only finalize.
+
+        rounded_cents is negative. We:
+          - Save txn with payment_method="payout".
+          - Open cash drawer (cashier dispenses winnings).
+          - Optionally print payout receipt.
+          - Show premium 'Payout Completed' popup (NOT change-due).
+          - Clear cart.
+        """
+        t = self.cart.totals
+        ref = db.next_transaction_ref()
+        txn = Transaction(
+            transaction_ref=ref,
+            subtotal_cents=t["subtotal_cents"],
+            discount_cents=t["discount_cents"],
+            gst_cents=t["gst_cents"],
+            pst_cents=t["pst_cents"],
+            deposit_cents=t["deposit_cents"],
+            bag_charge_cents=t["bag_charge_cents"],
+            total_cents=t["total_cents"],
+            rounded_total_cents=t["rounded_total_cents"],
+            payment_method="payout",
+            cash_tendered_cents=0,
+            change_cents=0,
+            cashier_id=self.cashier.id,
+            cashier_name=self.cashier.name,
+            shift_id=self.shift_id,
+            items=list(self.cart.lines),
+        )
+        items_data = [ln.to_db_dict() for ln in self.cart.lines]
+        lottery_records = [
+            {
+                "entry_type": "payout",
+                "amount_cents": abs(ln.unit_price_cents) * ln.quantity,
+                "cashier_name": self.cashier.name,
+                "shift_id": self.shift_id,
+                "description": ln.name,
+            }
+            for ln in self.cart.lines if ln.kind == "lottery"
+        ]
+        try:
+            tid = db.insert_transaction_with_lottery(
+                txn.header_dict(), items_data, lottery_records,
+            )
+        except Exception:
+            log.exception("payout transaction insert failed")
+            self._error("Failed to save payout. See errors.log.")
+            return
+
+        self._open_cash_drawer()
+        self._last_txn = txn
+        self._last_tid = tid
+        # Soft retail confirmation sound (reuse cash MP3; quieter than sale).
+        self._play_chaching()
+
+        # Optional receipt — same Print? prompt as card flow.
+        payout_amount = abs(rounded_cents)
+        prd = PrintReceiptDialog(
+            parent=self,
+            title="Payout Receipt?",
+            subtitle=f"Print payout receipt for ${payout_amount/100:.2f}?",
+            detail=f"PAYOUT  ·  {ref}",
+            ok_label="Print Receipt",
+        )
+        if prd.exec() == QDialog.DialogCode.Accepted:
+            try:
+                self._print_receipt(txn, tid)
+            except Exception:
+                log.exception("payout receipt print failed")
+                self._error("Payout saved but receipt failed to print. Use Reprint.")
+
+        # Premium 'Payout Completed' confirmation (not Change Due).
+        PayoutCompleteDialog(ref, payout_amount, parent=self).exec()
+
+        # Reset register state.
+        self.cart.clear()
+        self._cash_partial_cents = 0
+        try:
+            self.cart_widget.totals_panel.set_partial_paid(0)
+        except Exception:
+            pass
+        self._numpad_clear()
+        self.cart_widget.refresh()
+        self._refresh_deals_banner()
 
     def _finalize_cash(self, tender_cents: int, change_cents: int) -> None:
         t = self.cart.totals
@@ -2428,6 +2540,104 @@ class CashCountDialog(QDialog):
 
 
 # ─── Item picker (cashier search → choose from partial-match list) ──────────
+
+class PayoutCompleteDialog(QDialog):
+    """Premium 'Lottery Payout Completed' confirmation dialog.
+
+    Shown after a payout-only cash transaction. Distinct from ChangeDialog
+    so cashier sees clearly that money was paid OUT (not received).
+    """
+
+    def __init__(self, txn_ref: str, payout_cents: int,
+                 parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.setObjectName("payout_complete_dialog")
+        self.setModal(True)
+        self.setWindowFlags(
+            Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setStyleSheet(
+            styles.premium_dialog_qss() + styles.dialog_titlebar_qss()
+            + "QFrame#poShadow { background: white; border-radius: 14px;"
+            "  border: 1px solid #E1E4EA; }"
+        )
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(24, 24, 24, 24)
+        shadow = QFrame()
+        shadow.setObjectName("poShadow")
+        sv = QVBoxLayout(shadow); sv.setContentsMargins(0, 0, 0, 0); sv.setSpacing(0)
+
+        title_bar = QFrame()
+        title_bar.setObjectName("dialogTitle")
+        tb = QHBoxLayout(title_bar); tb.setContentsMargins(0, 0, 0, 0)
+        tlbl = QLabel("Lottery Payout Completed")
+        tlbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        tb.addWidget(tlbl)
+        sv.addWidget(title_bar)
+
+        body = QVBoxLayout()
+        body.setContentsMargins(28, 22, 28, 22)
+        body.setSpacing(8)
+        body.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+
+        ref_lbl = QLabel(f"Transaction {txn_ref}")
+        ref_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        ref_lbl.setStyleSheet("color: #8A8F95; font-size: 10pt; background: transparent;")
+        body.addWidget(ref_lbl)
+
+        check = QLabel("✓")
+        check.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        cf = QFont(styles.FONT_FAMILY, 36); cf.setBold(True)
+        check.setFont(cf)
+        check.setStyleSheet(f"color: {styles.COLORS['btn_lottery_p']}; background: transparent;")
+        body.addWidget(check)
+
+        cap = QLabel("Paid Out")
+        cap.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        cap.setStyleSheet("color: #5A6573; font-size: 12pt; background: transparent;")
+        body.addWidget(cap)
+
+        amt = QLabel(f"${payout_cents/100:.2f}")
+        amt.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        af = QFont(styles.FONT_FAMILY, 56); af.setBold(True)
+        amt.setFont(af)
+        amt.setStyleSheet(
+            f"color: {styles.COLORS['btn_lottery_p']}; background: transparent;"
+            f" padding: 4px;"
+        )
+        body.addWidget(amt)
+
+        sub = QLabel("Transaction saved successfully.")
+        sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        sub.setStyleSheet("color: #8A8F95; font-size: 10pt; background: transparent;")
+        body.addWidget(sub)
+
+        body.addSpacing(6)
+
+        ok = QPushButton("Done")
+        ok.setObjectName("payout_done")
+        ok.setMinimumSize(220, 56)
+        ok.setDefault(True)
+        ok.setAutoDefault(True)
+        ok.setStyleSheet(styles.pill_button_qss("primary"))
+        ok.clicked.connect(self.accept)
+        ok_row = QHBoxLayout()
+        ok_row.addStretch(1); ok_row.addWidget(ok); ok_row.addStretch(1)
+        body.addLayout(ok_row)
+
+        sv.addLayout(body)
+        outer.addWidget(shadow)
+        self.setMinimumSize(440, 360)
+        self.resize(460, 380)
+        ok.setFocus()
+
+    def keyPressEvent(self, ev) -> None:
+        if ev.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Escape):
+            self.accept(); return
+        super().keyPressEvent(ev)
+
 
 class PrintReceiptDialog(QDialog):
     """Premium receipt confirmation dialog.
