@@ -33,9 +33,11 @@ SUCCESS_PATH = SOUND_DIR / "success.wav"
 ERROR_PATH = SOUND_DIR / "error.wav"
 CHACHING_PATH = SOUND_DIR / "chaching.wav"
 
-# Premium MP3 transaction-completion clips at project root.
-CASH_MP3_PATH = Path("Cash-Register.mp3")
-CARD_MP3_PATH = Path("CardPayment.mp3")
+# Premium MP3 transaction-completion clips. Resolved relative to module
+# root so they load regardless of cwd.
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+CASH_MP3_PATH = _PROJECT_ROOT / "assets" / "sounds" / "cash_register.mp3"
+CARD_MP3_PATH = _PROJECT_ROOT / "assets" / "sounds" / "card_payment.mp3"
 
 
 # ─── WAV generators ──────────────────────────────────────────────────────────
@@ -199,18 +201,19 @@ class SoundPlayer:
     # ─── MP3 transaction-completion clips ────────────────────────────────────
 
     def _load_mp3_completion_sounds(self) -> None:
-        """Preload Cash-Register.mp3 and CardPayment.mp3 via QMediaPlayer.
+        """Preload cash_register.mp3 and card_payment.mp3 via QMediaPlayer.
 
         Failsafe: if QtMultimedia MP3 backend or files unavailable, skip
         silently — no exceptions surfaced to the cashier flow.
         """
-        for name, path, base_vol in [
-            ("cash", CASH_MP3_PATH, 0.70),   # ~70%
-            ("card", CARD_MP3_PATH, 0.60),   # ~60%
+        for name, path, base_vol, friendly in [
+            ("cash", CASH_MP3_PATH, 0.70, "cash_register.mp3"),
+            ("card", CARD_MP3_PATH, 0.60, "card_payment.mp3"),
         ]:
             try:
                 if not path.exists():
-                    log.warning("payment sound missing: %s", path)
+                    log.warning("[Sound] %s not found at %s", friendly, path)
+                    print(f"[Sound] {friendly} not found at {path}")
                     continue
                 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
                 player = QMediaPlayer()
@@ -219,8 +222,11 @@ class SoundPlayer:
                 player.setSource(QUrl.fromLocalFile(str(path.resolve())))
                 out.setVolume(base_vol * self.volume)
                 self._mp3[name] = (player, out, base_vol)
+                log.info("[Sound] loaded %s (vol %.2f)", friendly,
+                         base_vol * self.volume)
             except Exception:
-                log.exception("failed loading payment sound %s", path)
+                log.exception("[Sound] failed loading %s", friendly)
+                print(f"[Sound] failed loading {friendly}")
 
     def _play_mp3(self, name: str) -> None:
         if not self.enabled:

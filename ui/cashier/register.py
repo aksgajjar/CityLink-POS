@@ -1821,8 +1821,13 @@ class RegisterScreen(QWidget):
         self._play_card_approved()
         dlg = PrintReceiptDialog(
             parent=self,
-            subtitle="Print receipt for the customer?",
+            title="Card Approved",
+            subtitle="Print merchant + customer card receipts?",
             detail=f"APPROVED  ·  {req.transaction_ref}  ·  Auth {resp.auth_code}  ·  …{last4}",
+            ok_label="Yes",
+            cancel_label="No",
+            glyph="✓",
+            glyph_color=styles.COLORS["btn_cash"],
         )
         if dlg.exec() == QDialog.DialogCode.Accepted:
             try:
@@ -2704,7 +2709,9 @@ class PrintReceiptDialog(QDialog):
                  detail: str = "You can also reprint later from Receipts.",
                  parent: Optional[QWidget] = None,
                  ok_label: str = "Print Receipt",
-                 cancel_label: str = "No Thanks"):
+                 cancel_label: str = "No Thanks",
+                 glyph: str = "🧾",
+                 glyph_color: Optional[str] = None):
         super().__init__(parent)
         self.setObjectName("print_receipt_dialog")
         self.setWindowTitle(title)
@@ -2747,10 +2754,13 @@ class PrintReceiptDialog(QDialog):
         # Receipt glyph + subtitle
         head = QHBoxLayout()
         head.setSpacing(14)
-        glyph = QLabel("🧾")
-        gf = QFont(styles.FONT_FAMILY, 28); glyph.setFont(gf)
-        glyph.setStyleSheet("background: transparent;")
-        head.addWidget(glyph)
+        glyph_lbl = QLabel(glyph)
+        gf = QFont(styles.FONT_FAMILY, 28); gf.setBold(True); glyph_lbl.setFont(gf)
+        glyph_color_css = (
+            f"color: {glyph_color}; " if glyph_color else ""
+        )
+        glyph_lbl.setStyleSheet(f"{glyph_color_css}background: transparent;")
+        head.addWidget(glyph_lbl)
         sub_v = QVBoxLayout(); sub_v.setSpacing(2)
         sub = QLabel(subtitle)
         sf = QFont(styles.FONT_FAMILY, 13); sf.setBold(True)
